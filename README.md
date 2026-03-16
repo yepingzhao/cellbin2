@@ -234,7 +234,7 @@ CUDA_VISIBLE_DEVICES=0 python cellbin2/cellbin_pipeline.py \
 -p Stereocell_analysis.json \ # Personalized Json File
 -o test/SN \ # output dir
 ```
-please modify [Stereocell_analysis.json](\cellbin2\config\demos\Stereocell_analysis.json)<br>
+please modify [Stereocell_analysis.json](cellbin2/config/demos/Stereocell_analysis.json)<br>
 
 > more examples, please visit [example.md](docs/v2/example.md)
 ### Cell Segmentation Customization
