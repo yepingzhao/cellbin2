@@ -1,11 +1,12 @@
 # Log Management
+import io
+import logging
 import os
 import os.path as o_p
-import logging
+
 # from coloredlogs import ColoredFormatter
 import sys
 import time
-import io
 
 PROG_VERSION = '0.1'
 PROG_DATE = '2021-07-25'

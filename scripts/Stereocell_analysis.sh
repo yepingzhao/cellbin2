@@ -2,7 +2,13 @@
 
 # conda activate /opt/miniforge3/envs/env-cellbinv2
 
-CUDA_VISIBLE_DEVICES=0 python cellbin2/cellbin_pipeline.py \
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+source "${SCRIPT_DIR}/setup_ort_cuda_env.sh"
+
+CUDA_VISIBLE_DEVICES=0 "${PYTHON_BIN}" "${REPO_ROOT}/cellbin2/cellbin_pipeline.py" \
     -c SN \
-    -p cellbin2/config/demos/Stereocell_analysis.json \
-    -o test/SN
+    -p "${REPO_ROOT}/cellbin2/config/demos/Stereocell_analysis.json" \
+    -o "${REPO_ROOT}/test/SN"

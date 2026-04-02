@@ -1,0 +1,23 @@
+{
+    "configurations": [
+        {
+            "name": "Python: Cellbin2 Pipeline",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "cellbin2/cellbin_pipeline.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0"
+            },
+            "args": [
+                "-c",
+                "SN",
+                "-p",
+                "cellbin2/config/demos/Stereocell_analysis.json",
+                "-o",
+                "test/SN"
+            ]
+        }
+    ]
+}
