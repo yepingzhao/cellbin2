@@ -1,7 +1,7 @@
 {
   "image_process": {
     "0": {
-      "file_path": "E:/pyproject/cellbin_stereocell_analysis/cellbin2/data/Q00327K8.tiff",
+      "file_path": "data/Y40178MC/Y40178MC.tif",
       "tech_type": "DAPI",
       "chip_detect": true,
       "quality_control": true,
@@ -18,7 +18,7 @@
       "tissue_filter": -1
     },
     "1": {
-      "file_path": "E:/pyproject/cellbin_stereocell_analysis/cellbin2/data/Q00327K8.raw.gef",
+      "file_path": "data/Y40178MC/Y40178MC.gef",
       "tech_type": "Transcriptomics",
       "chip_detect": false,
       "quality_control": false,
@@ -39,20 +39,22 @@
     "Transcriptomics": {
       "exp_matrix": 1,
       "cell_mask": {
-        "nuclei":[0],
+        "nuclei": [
+          0
+        ],
         "interior": [],
-        "boundary":[],
-        "matrix":[]
+        "boundary": [],
+        "matrix": []
       },
       "correct_r": 10,
       "extra_method": ""
     }
   },
   "run": {
-      "qc": false,
-      "alignment": true,
-      "matrix_extract": true,
-      "report": false,
-      "annotation": false
+    "qc": false,
+    "alignment": true,
+    "matrix_extract": true,
+    "report": false,
+    "annotation": false
   }
 }

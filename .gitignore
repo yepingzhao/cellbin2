@@ -7,3 +7,7 @@ weights/
 /build/
 /cellbin2.egg-info/
 /cellbin2/contrib/cell_core.py
+
+data/
+test/
+*.log

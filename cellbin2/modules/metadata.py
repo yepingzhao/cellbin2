@@ -284,14 +284,14 @@ class ProcParam(BaseModel):
 
         return images
 
-    def get_molecular_classify(self) -> Dict[int, ProcMolecularFile]:
+    def get_molecular_classify(self) -> Dict[str, ProcMolecularFile]:
         """
         Retrieves molecular classification files.
         
         Returns:
-            Dict[int, ProcMolecularFile]: Dictionary of molecular classification files.
+            Dict[str, ProcMolecularFile]: Dictionary of molecular classification files.
         """
-        files = {int(idx): f for idx, f in self.molecular_classify.items()}
+        files = {str(idx): f for idx, f in self.molecular_classify.items()}
         return files
 
 
