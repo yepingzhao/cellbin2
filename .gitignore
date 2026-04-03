@@ -9,5 +9,6 @@ weights/
 /cellbin2/contrib/cell_core.py
 
 data/
+__pycache__/
 test/
 *.log
