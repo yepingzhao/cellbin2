@@ -9,8 +9,8 @@ from typing import Any, Dict, Iterable, List, Optional, Union
 import h5py
 import numpy as np
 
-
-DEFAULT_GEF = Path("test/Y40178MC/Y40178MC_Transcriptomics.cellbin.gef")
+# DEFAULT_GEF = Path("test/Y40178MC/Y40178MC_Transcriptomics.cellbin.gef")
+DEFAULT_GEF = Path("test/Y40178MC/Y40178MC_Transcriptomics.adjusted.cellbin.gef")
 
 
 def _to_builtin(value: Any) -> Any:
