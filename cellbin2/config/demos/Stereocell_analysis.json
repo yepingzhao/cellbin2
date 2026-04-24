@@ -1,43 +1,26 @@
 {
   "image_process": {
     "0": {
-      "file_path": "data/Y40178MC/Y40178MC.tif",
-      "tech_type": "DAPI",
-      "chip_detect": true,
-      "quality_control": true,
-      "registration": {
-        "fixed_image": -1,
-        "trackline": true,
-        "reuse": -1
-      },
-      "tissue_segmentation": false,
-      "cell_segmentation": true,
-      "channel_align": -1,
-      "magnification": 10,
-      "chip_matching": -1,
-      "tissue_filter": -1
-    },
-    "1": {
       "file_path": "data/Y40178MC/Y40178MC.gef",
       "tech_type": "Transcriptomics",
       "chip_detect": false,
       "quality_control": false,
-      "registration": {
-        "fixed_image": -1,
-        "trackline": true,
-        "reuse": -1
-      },
       "tissue_segmentation": false,
       "cell_segmentation": true,
       "channel_align": -1,
       "magnification": 10,
+      "registration": {
+        "fixed_image": -1,
+        "trackline": false,
+        "reuse": -1
+      },
       "chip_matching": -1,
       "tissue_filter": -1
     }
   },
   "molecular_classify": {
-    "Transcriptomics": {
-      "exp_matrix": 1,
+    "0": {
+      "exp_matrix": 0,
       "cell_mask": {
         "nuclei": [
           0
