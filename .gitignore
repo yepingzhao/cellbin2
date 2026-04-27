@@ -10,6 +10,7 @@ weights/
 
 data/
 __pycache__/
+outputs/
 !test/
 test/*
 !test/*.py
