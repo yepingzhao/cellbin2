@@ -33,7 +33,7 @@ def write_label_mask(path: Path, label_image: np.ndarray) -> None:
     tifffile.imwrite(path, label_image.astype(np.uint8))
 
 
-def make_polygon_frame(rows: list[dict[str, object]]) -> pd.DataFrame:
+def make_cell_frame(rows: list[dict[str, object]]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
@@ -90,8 +90,8 @@ class MixedGemTest(unittest.TestCase):
             self.assertTrue(gef_path.exists())
 
 
-class PolygonExtractionTest(unittest.TestCase):
-    def test_extract_cell_polygons_handles_single_pixel_components(self) -> None:
+class CellMetadataExtractionTest(unittest.TestCase):
+    def test_extract_cell_metadata_handles_single_pixel_components(self) -> None:
         label_image = np.array(
             [
                 [1, 0, 2],
@@ -101,81 +101,151 @@ class PolygonExtractionTest(unittest.TestCase):
             dtype=np.int32,
         )
 
-        stats = sim_crosstalk.extract_cell_polygons(label_image, source_name="MC")
+        stats = sim_crosstalk.extract_cell_metadata(label_image, source_name="MC")
 
         self.assertEqual(sorted(stats["cell_label"].tolist()), ["MC_1", "MC_2", "MC_3"])
-        self.assertTrue(all(str(value).startswith("POLYGON") for value in stats["contour_wkt"]))
+        self.assertNotIn("contour_wkt", stats.columns)
+        self.assertEqual(stats.set_index("cell_label").loc["MC_1", "area"], 1)
 
 
 class MappingRuleTest(unittest.TestCase):
-    def test_map_mixed_cells_prefers_highest_iou_and_marks_doublets(self) -> None:
-        mixed_cells = make_polygon_frame(
+    def test_map_mixed_cells_prefers_highest_coverage_and_marks_doublets(self) -> None:
+        mixed_labels = np.array(
+            [
+                [1, 1, 0, 2, 2, 2, 2],
+                [1, 1, 0, 2, 2, 2, 2],
+                [0, 0, 0, 0, 0, 0, 0],
+                [3, 3, 0, 0, 0, 0, 0],
+                [3, 3, 0, 0, 0, 0, 0],
+            ],
+            dtype=np.int32,
+        )
+        mc_labels = np.array(
+            [
+                [10, 10, 0, 20, 20, 0, 0],
+                [10, 10, 0, 20, 20, 0, 0],
+                [0, 0, 0, 0, 0, 0, 0],
+                [30, 31, 0, 0, 0, 0, 0],
+                [30, 31, 0, 0, 0, 0, 0],
+            ],
+            dtype=np.int32,
+        )
+        p5_labels = np.array(
+            [
+                [0, 0, 0, 0, 0, 40, 40],
+                [0, 0, 0, 0, 0, 40, 40],
+                [0, 0, 0, 0, 0, 0, 0],
+                [0, 0, 0, 0, 0, 0, 0],
+                [0, 0, 0, 0, 0, 0, 0],
+            ],
+            dtype=np.int32,
+        )
+        mixed_cells = make_cell_frame(
             [
                 {
                     "cell_label": "mixed_only_mc",
                     "source": "mixed",
-                    "contour_wkt": "POLYGON ((0 0, 2 0, 2 2, 0 2, 0 0))",
+                    "pixel_label": 1,
+                    "area": 4,
                 },
                 {
                     "cell_label": "mixed_doublet",
                     "source": "mixed",
-                    "contour_wkt": "POLYGON ((10 0, 14 0, 14 4, 10 4, 10 0))",
+                    "pixel_label": 2,
+                    "area": 8,
                 },
                 {
                     "cell_label": "mixed_tie",
                     "source": "mixed",
-                    "contour_wkt": "POLYGON ((20 0, 22 0, 22 2, 20 2, 20 0))",
+                    "pixel_label": 3,
+                    "area": 4,
                 },
             ]
         )
-        mc_cells = make_polygon_frame(
+        mc_cells = make_cell_frame(
             [
                 {
                     "cell_label": "MC_a",
                     "source": "MC",
-                    "contour_wkt": "POLYGON ((0 0, 2 0, 2 2, 0 2, 0 0))",
+                    "pixel_label": 10,
+                    "area": 4,
                 },
                 {
                     "cell_label": "MC_b",
                     "source": "MC",
-                    "contour_wkt": "POLYGON ((10 0, 12 0, 12 4, 10 4, 10 0))",
+                    "pixel_label": 20,
+                    "area": 4,
                 },
                 {
                     "cell_label": "MC_c",
                     "source": "MC",
-                    "contour_wkt": "POLYGON ((20 0, 22 0, 22 2, 20 2, 20 0))",
+                    "pixel_label": 30,
+                    "area": 2,
                 },
                 {
                     "cell_label": "MC_d",
                     "source": "MC",
-                    "contour_wkt": "POLYGON ((20 0, 22 0, 22 2, 20 2, 20 0))",
+                    "pixel_label": 31,
+                    "area": 2,
                 },
             ]
         )
-        p5_cells = make_polygon_frame(
+        p5_cells = make_cell_frame(
             [
                 {
                     "cell_label": "P5_a",
                     "source": "P5",
-                    "contour_wkt": "POLYGON ((12 0, 14 0, 14 4, 12 4, 12 0))",
+                    "pixel_label": 40,
+                    "area": 4,
                 }
             ]
         )
 
         candidates, mapping = sim_crosstalk.map_mixed_cells(
+            mixed_labels=mixed_labels,
+            mc_labels=mc_labels,
+            p5_labels=p5_labels,
             mixed_cells=mixed_cells,
             mc_cells=mc_cells,
             p5_cells=p5_cells,
-            iou_threshold=0.1,
+            min_mixed_coverage=0.1,
         )
 
         self.assertGreaterEqual(len(candidates), 4)
         result = mapping.set_index("mixed_cell_label")
         self.assertEqual(result.loc["mixed_only_mc", "mapped_source_dataset"], "MC")
         self.assertEqual(result.loc["mixed_only_mc", "mapped_source_label"], "MC_a")
+        self.assertEqual(result.loc["mixed_only_mc", "mapped_overlap_pixels"], 4)
+        self.assertEqual(result.loc["mixed_only_mc", "mapped_mixed_coverage"], 1.0)
         self.assertTrue(bool(result.loc["mixed_doublet", "is_doublet"]))
-        self.assertEqual(result.loc["mixed_doublet", "doublet_reason"], "cross_source_overlap")
+        self.assertEqual(result.loc["mixed_doublet", "doublet_reason"], "cross_source_mask_overlap")
         self.assertEqual(result.loc["mixed_tie", "mapped_source_label"], "MC_c")
+        self.assertEqual(result.loc["mixed_tie", "mapped_mixed_coverage"], 0.5)
+
+    def test_map_mixed_cells_uses_shared_extent_for_mask_overlap(self) -> None:
+        mixed_labels = np.array([[1, 1], [1, 1]], dtype=np.int32)
+        mc_labels = np.array([[0, 0], [0, 0], [2, 2]], dtype=np.int32)
+        p5_labels = np.zeros((2, 2), dtype=np.int32)
+        mixed_cells = make_cell_frame([{"cell_label": "mixed_1", "source": "mixed", "pixel_label": 1, "area": 4}])
+        mc_cells = make_cell_frame([{"cell_label": "MC_2", "source": "MC", "pixel_label": 2, "area": 2}])
+        p5_cells = pd.DataFrame(columns=["cell_label", "source", "pixel_label", "area"])
+
+        candidates, mapping = sim_crosstalk.map_mixed_cells(
+            mixed_labels=mixed_labels,
+            mc_labels=mc_labels,
+            p5_labels=p5_labels,
+            mixed_cells=mixed_cells,
+            mc_cells=mc_cells,
+            p5_cells=p5_cells,
+            min_mixed_coverage=0.1,
+        )
+
+        self.assertTrue(candidates.empty)
+        row = mapping.iloc[0]
+        self.assertEqual(row["mapped_source_dataset"], "")
+        self.assertEqual(row["mapped_source_label"], "")
+        self.assertEqual(row["mapped_overlap_pixels"], 0)
+        self.assertEqual(row["mapped_mixed_coverage"], 0.0)
 
     def test_filter_mixed_doublets_removes_all_rows_for_doublet_cells(self) -> None:
         molecules = pd.DataFrame(
@@ -216,8 +286,8 @@ class MappingRuleTest(unittest.TestCase):
                     "mixed_cell_label": "mixed_2",
                     "mapped_source_dataset": "P5",
                     "mapped_source_label": "P5_9",
-                    "mapped_iou": 0.8,
-                    "mapped_intersection_area": 12.0,
+                    "mapped_mixed_coverage": 0.8,
+                    "mapped_overlap_pixels": 12,
                     "is_doublet": False,
                     "doublet_reason": "",
                 },
@@ -225,8 +295,8 @@ class MappingRuleTest(unittest.TestCase):
                     "mixed_cell_label": "mixed_1",
                     "mapped_source_dataset": "MC",
                     "mapped_source_label": "MC_7",
-                    "mapped_iou": 0.9,
-                    "mapped_intersection_area": 15.0,
+                    "mapped_mixed_coverage": 0.9,
+                    "mapped_overlap_pixels": 15,
                     "is_doublet": False,
                     "doublet_reason": "",
                 },
@@ -234,8 +304,8 @@ class MappingRuleTest(unittest.TestCase):
                     "mixed_cell_label": "mixed_drop",
                     "mapped_source_dataset": "",
                     "mapped_source_label": "",
-                    "mapped_iou": 0.0,
-                    "mapped_intersection_area": 0.0,
+                    "mapped_mixed_coverage": 0.0,
+                    "mapped_overlap_pixels": 0,
                     "is_doublet": False,
                     "doublet_reason": "",
                 },
@@ -305,8 +375,8 @@ class MappingRuleTest(unittest.TestCase):
                     "mixed_cell_label": "mixed_3",
                     "mapped_source_dataset": "MC",
                     "mapped_source_label": "MC_missing",
-                    "mapped_iou": 0.7,
-                    "mapped_intersection_area": 10.0,
+                    "mapped_mixed_coverage": 0.7,
+                    "mapped_overlap_pixels": 10,
                     "is_doublet": False,
                     "doublet_reason": "",
                 },
@@ -314,8 +384,8 @@ class MappingRuleTest(unittest.TestCase):
                     "mixed_cell_label": "mixed_2",
                     "mapped_source_dataset": "P5",
                     "mapped_source_label": "P5_9",
-                    "mapped_iou": 0.8,
-                    "mapped_intersection_area": 12.0,
+                    "mapped_mixed_coverage": 0.8,
+                    "mapped_overlap_pixels": 12,
                     "is_doublet": False,
                     "doublet_reason": "",
                 },
@@ -323,8 +393,8 @@ class MappingRuleTest(unittest.TestCase):
                     "mixed_cell_label": "mixed_1",
                     "mapped_source_dataset": "MC",
                     "mapped_source_label": "MC_7",
-                    "mapped_iou": 0.9,
-                    "mapped_intersection_area": 15.0,
+                    "mapped_mixed_coverage": 0.9,
+                    "mapped_overlap_pixels": 15,
                     "is_doublet": False,
                     "doublet_reason": "",
                 },
@@ -366,42 +436,6 @@ class MappingRuleTest(unittest.TestCase):
             (10584, 10583, 11760, 11759),
         )
 
-    def test_select_cells_in_view_keeps_polygons_that_cross_tile_boundary(self) -> None:
-        cell_df = make_polygon_frame(
-            [
-                {
-                    "cell_label": "mixed_1",
-                    "source": "mixed",
-                    "pixel_label": 1,
-                    "area": 16,
-                    "bbox_min_x": 8,
-                    "bbox_min_y": 8,
-                    "bbox_max_x": 12,
-                    "bbox_max_y": 12,
-                    "centroid_x": 10.0,
-                    "centroid_y": 10.0,
-                    "contour_wkt": "POLYGON ((8 8, 12 8, 12 12, 8 12, 8 8))",
-                },
-                {
-                    "cell_label": "mixed_2",
-                    "source": "mixed",
-                    "pixel_label": 2,
-                    "area": 16,
-                    "bbox_min_x": 13,
-                    "bbox_min_y": 13,
-                    "bbox_max_x": 17,
-                    "bbox_max_y": 17,
-                    "centroid_x": 15.0,
-                    "centroid_y": 15.0,
-                    "contour_wkt": "POLYGON ((13 13, 17 13, 17 17, 13 17, 13 13))",
-                },
-            ]
-        )
-
-        selected = sim_crosstalk.select_cells_in_view(cell_df, (10, 10, 14, 14))
-
-        self.assertEqual(selected["cell_label"].tolist(), ["mixed_1", "mixed_2"])
-
     def test_write_spatial_visualization_outputs_png(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
@@ -414,7 +448,7 @@ class MappingRuleTest(unittest.TestCase):
             mixed_labels[10592:10603, 10592:10603] = 1
             mixed_labels[10595:10606, 10595:10606] = 2
 
-            mc_cells = make_polygon_frame(
+            mc_cells = make_cell_frame(
                 [
                     {
                         "cell_label": "MC_1",
@@ -427,11 +461,10 @@ class MappingRuleTest(unittest.TestCase):
                         "bbox_max_y": 10600,
                         "centroid_x": 10595.0,
                         "centroid_y": 10595.0,
-                        "contour_wkt": "POLYGON ((10590 10590, 10600 10590, 10600 10600, 10590 10600, 10590 10590))",
                     }
                 ]
             )
-            p5_cells = make_polygon_frame(
+            p5_cells = make_cell_frame(
                 [
                     {
                         "cell_label": "P5_1",
@@ -444,11 +477,10 @@ class MappingRuleTest(unittest.TestCase):
                         "bbox_max_y": 10599,
                         "centroid_x": 10595.0,
                         "centroid_y": 10594.0,
-                        "contour_wkt": "POLYGON ((10590 10589, 10600 10589, 10600 10599, 10590 10599, 10590 10589))",
                     }
                 ]
             )
-            mixed_cells = make_polygon_frame(
+            mixed_cells = make_cell_frame(
                 [
                     {
                         "cell_label": "mixed_1",
@@ -461,7 +493,6 @@ class MappingRuleTest(unittest.TestCase):
                         "bbox_max_y": 10602,
                         "centroid_x": 10597.0,
                         "centroid_y": 10597.0,
-                        "contour_wkt": "POLYGON ((10592 10592, 10602 10592, 10602 10602, 10592 10602, 10592 10592))",
                     },
                     {
                         "cell_label": "mixed_2",
@@ -474,7 +505,6 @@ class MappingRuleTest(unittest.TestCase):
                         "bbox_max_y": 10605,
                         "centroid_x": 10600.0,
                         "centroid_y": 10600.0,
-                        "contour_wkt": "POLYGON ((10595 10595, 10605 10595, 10605 10605, 10595 10605, 10595 10595))",
                     },
                 ]
             )
@@ -484,8 +514,8 @@ class MappingRuleTest(unittest.TestCase):
                         "mixed_cell_label": "mixed_1",
                         "mapped_source_dataset": "MC",
                         "mapped_source_label": "MC_1",
-                        "mapped_iou": 0.9,
-                        "mapped_intersection_area": 10.0,
+                        "mapped_mixed_coverage": 0.9,
+                        "mapped_overlap_pixels": 10,
                         "is_doublet": False,
                         "doublet_reason": "",
                     },
@@ -493,10 +523,10 @@ class MappingRuleTest(unittest.TestCase):
                         "mixed_cell_label": "mixed_2",
                         "mapped_source_dataset": "P5",
                         "mapped_source_label": "P5_1",
-                        "mapped_iou": 0.8,
-                        "mapped_intersection_area": 9.0,
+                        "mapped_mixed_coverage": 0.8,
+                        "mapped_overlap_pixels": 9,
                         "is_doublet": True,
-                        "doublet_reason": "cross_source_overlap",
+                        "doublet_reason": "cross_source_mask_overlap",
                     },
                 ]
             )
@@ -516,7 +546,7 @@ class MappingRuleTest(unittest.TestCase):
             self.assertTrue(output_path.exists())
             self.assertGreater(output_path.stat().st_size, 0)
 
-    def test_write_spatial_visualization_accepts_multipolygon_cells(self) -> None:
+    def test_write_spatial_visualization_accepts_cell_metadata_without_polygon_column(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
             output_path = tmp_path / "spatial_tile_r10_c10.png"
@@ -526,7 +556,7 @@ class MappingRuleTest(unittest.TestCase):
             mc_labels[10590:10606, 10590:10606] = 1
             mixed_labels[10592:10603, 10592:10603] = 1
 
-            mc_cells = make_polygon_frame(
+            mc_cells = make_cell_frame(
                 [
                     {
                         "cell_label": "MC_1",
@@ -539,15 +569,11 @@ class MappingRuleTest(unittest.TestCase):
                         "bbox_max_y": 10605,
                         "centroid_x": 10597.5,
                         "centroid_y": 10597.5,
-                        "contour_wkt": (
-                            "MULTIPOLYGON (((10590 10590, 10595 10590, 10595 10595, 10590 10595, 10590 10590)), "
-                            "((10600 10600, 10605 10600, 10605 10605, 10600 10605, 10600 10600)))"
-                        ),
                     }
                 ]
             )
             p5_cells = pd.DataFrame(columns=sim_crosstalk.CELL_COLUMNS)
-            mixed_cells = make_polygon_frame(
+            mixed_cells = make_cell_frame(
                 [
                     {
                         "cell_label": "mixed_1",
@@ -560,7 +586,6 @@ class MappingRuleTest(unittest.TestCase):
                         "bbox_max_y": 10602,
                         "centroid_x": 10597.0,
                         "centroid_y": 10597.0,
-                        "contour_wkt": "POLYGON ((10592 10592, 10602 10592, 10602 10602, 10592 10602, 10592 10592))",
                     }
                 ]
             )
@@ -570,8 +595,8 @@ class MappingRuleTest(unittest.TestCase):
                         "mixed_cell_label": "mixed_1",
                         "mapped_source_dataset": "MC",
                         "mapped_source_label": "MC_1",
-                        "mapped_iou": 0.9,
-                        "mapped_intersection_area": 10.0,
+                        "mapped_mixed_coverage": 0.9,
+                        "mapped_overlap_pixels": 10,
                         "is_doublet": False,
                         "doublet_reason": "",
                     }
@@ -605,7 +630,7 @@ class MappingRuleTest(unittest.TestCase):
             p5_labels[15:19, 14:18] = 7
 
             mc_cells = pd.DataFrame(columns=sim_crosstalk.CELL_COLUMNS)
-            p5_cells = make_polygon_frame(
+            p5_cells = make_cell_frame(
                 [
                     {
                         "cell_label": "P5_7",
@@ -618,11 +643,10 @@ class MappingRuleTest(unittest.TestCase):
                         "bbox_max_y": 18,
                         "centroid_x": 15.5,
                         "centroid_y": 16.5,
-                        "contour_wkt": "POLYGON ((14 15, 18 15, 18 19, 14 19, 14 15))",
                     }
                 ]
             )
-            mixed_cells = make_polygon_frame(
+            mixed_cells = make_cell_frame(
                 [
                     {
                         "cell_label": "mixed_1",
@@ -635,7 +659,6 @@ class MappingRuleTest(unittest.TestCase):
                         "bbox_max_y": 14,
                         "centroid_x": 13.0,
                         "centroid_y": 13.0,
-                        "contour_wkt": "POLYGON ((12 12, 15 12, 15 15, 12 15, 12 12))",
                     }
                 ]
             )
@@ -645,8 +668,8 @@ class MappingRuleTest(unittest.TestCase):
                         "mixed_cell_label": "mixed_1",
                         "mapped_source_dataset": "P5",
                         "mapped_source_label": "P5_7",
-                        "mapped_iou": 0.8,
-                        "mapped_intersection_area": 5.0,
+                        "mapped_mixed_coverage": 0.8,
+                        "mapped_overlap_pixels": 5,
                         "is_doublet": False,
                         "doublet_reason": "",
                     }
@@ -1008,7 +1031,7 @@ class NotebookFlowTest(unittest.TestCase):
             "sim_crosstalk.prepare_cellbin2_config",
             "sim_crosstalk.run_cellbin2",
             "sim_crosstalk.load_final_cell_labels",
-            "sim_crosstalk.extract_cell_polygons",
+            "sim_crosstalk.extract_cell_metadata",
             "sim_crosstalk.assign_molecules_to_cells",
             "sim_crosstalk.map_mixed_cells",
             "sim_crosstalk.filter_mixed_doublets",

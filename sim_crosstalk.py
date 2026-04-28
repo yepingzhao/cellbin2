@@ -19,11 +19,7 @@ import pandas as pd
 import tifffile
 from matplotlib.colors import to_rgb
 from scipy import sparse
-from shapely import wkt
-from shapely.geometry import Polygon
-from shapely.geometry import box
-from shapely.strtree import STRtree
-from skimage.measure import find_contours, label, regionprops_table
+from skimage.measure import label, regionprops_table
 
 SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parent
@@ -45,7 +41,6 @@ CELL_COLUMNS = [
     "bbox_max_y",
     "centroid_x",
     "centroid_y",
-    "contour_wkt",
 ]
 DEFAULT_TILE_GRID_SIZE = 20
 DEFAULT_TILE_ROW = 10
@@ -256,18 +251,7 @@ def load_final_cell_labels(mask_path: Path) -> np.ndarray:
     return label_image
 
 
-def contour_to_polygon(points: np.ndarray) -> Polygon:
-    if len(points) < 3:
-        raise ValueError("contour requires at least 3 points")
-    polygon = Polygon(points)
-    if not polygon.is_valid:
-        polygon = polygon.buffer(0)
-    if polygon.is_empty:
-        raise ValueError("contour produced empty polygon")
-    return polygon
-
-
-def extract_cell_polygons(label_image: np.ndarray, source_name: str) -> pd.DataFrame:
+def extract_cell_metadata(label_image: np.ndarray, source_name: str) -> pd.DataFrame:
     if int(label_image.max()) == 0:
         return pd.DataFrame(columns=CELL_COLUMNS)
 
@@ -279,23 +263,6 @@ def extract_cell_polygons(label_image: np.ndarray, source_name: str) -> pd.DataF
         min_col = int(props["bbox-1"][idx])
         max_row = int(props["bbox-2"][idx]) - 1
         max_col = int(props["bbox-3"][idx]) - 1
-        region_mask = label_image[min_row : max_row + 1, min_col : max_col + 1] == pixel_label
-        if region_mask.shape[0] < 2 or region_mask.shape[1] < 2:
-            polygon = box(min_col, min_row, max_col + 1, max_row + 1)
-        else:
-            contours = find_contours(region_mask.astype(np.uint8), level=0.5)
-            if contours:
-                contour = max(contours, key=len)
-                contour_xy = np.column_stack((contour[:, 1] + min_col, contour[:, 0] + min_row))
-                if len(contour_xy) < 3:
-                    polygon = box(min_col, min_row, max_col + 1, max_row + 1)
-                else:
-                    try:
-                        polygon = contour_to_polygon(contour_xy)
-                    except ValueError:
-                        polygon = box(min_col, min_row, max_col + 1, max_row + 1)
-            else:
-                polygon = box(min_col, min_row, max_col + 1, max_row + 1)
         rows.append(
             {
                 "cell_label": f"{source_name}_{pixel_label}",
@@ -308,7 +275,6 @@ def extract_cell_polygons(label_image: np.ndarray, source_name: str) -> pd.DataF
                 "bbox_max_y": max_row,
                 "centroid_x": float(props["centroid-1"][idx]),
                 "centroid_y": float(props["centroid-0"][idx]),
-                "contour_wkt": polygon.wkt,
             }
         )
     return pd.DataFrame(rows, columns=CELL_COLUMNS)
@@ -348,60 +314,109 @@ def assign_molecules_to_cells(
     return pd.concat(rows, ignore_index=True)
 
 
-def build_spatial_index(cell_df: pd.DataFrame) -> tuple[STRtree, list[Polygon], dict[int, str]]:
-    polygons = [wkt.loads(value) for value in cell_df["contour_wkt"].tolist()]
-    tree = STRtree(polygons)
-    index_to_label = {
-        index: str(cell_df.iloc[index]["cell_label"]) for index in range(len(cell_df))
-    }
-    return tree, polygons, index_to_label
-
-
-def _collect_overlap_candidates(
+def _collect_mask_overlap_candidates(
+    mixed_labels: np.ndarray,
+    source_labels: np.ndarray,
     mixed_cells: pd.DataFrame,
     source_cells: pd.DataFrame,
     source_name: str,
-    iou_threshold: float,
+    min_mixed_coverage: float,
 ) -> list[dict[str, object]]:
     if mixed_cells.empty or source_cells.empty:
         return []
 
-    tree, polygons, index_to_label = build_spatial_index(source_cells)
-    candidates: list[dict[str, object]] = []
-    for mixed_index, mixed_row in mixed_cells.iterrows():
-        mixed_polygon = wkt.loads(str(mixed_row["contour_wkt"]))
-        candidate_indices = tree.query(mixed_polygon)
-        for candidate_index in candidate_indices.tolist():
-            source_polygon = polygons[int(candidate_index)]
-            intersection_area = float(mixed_polygon.intersection(source_polygon).area)
-            if intersection_area <= 0.0:
-                continue
-            union_area = float(mixed_polygon.union(source_polygon).area)
-            iou = intersection_area / union_area if union_area > 0.0 else 0.0
-            if iou < iou_threshold:
-                continue
-            candidates.append(
-                {
-                    "mixed_cell_label": str(mixed_row["cell_label"]),
-                    "mixed_source": str(mixed_row["source"]),
-                    "source_dataset": source_name,
-                    "source_cell_label": index_to_label[int(candidate_index)],
-                    "iou": iou,
-                    "intersection_area": intersection_area,
-                    "union_area": union_area,
-                }
-            )
-    return candidates
+    shared_height = min(mixed_labels.shape[0], source_labels.shape[0])
+    shared_width = min(mixed_labels.shape[1], source_labels.shape[1])
+    if shared_height == 0 or shared_width == 0:
+        return []
+
+    mixed_view = mixed_labels[:shared_height, :shared_width]
+    source_view = source_labels[:shared_height, :shared_width]
+    overlap_mask = (mixed_view > 0) & (source_view > 0)
+    if not np.any(overlap_mask):
+        return []
+
+    overlap_pairs = pd.DataFrame(
+        {
+            "mixed_pixel_label": mixed_view[overlap_mask].astype(np.int32),
+            "source_pixel_label": source_view[overlap_mask].astype(np.int32),
+        }
+    )
+    overlap_pairs = (
+        overlap_pairs.groupby(["mixed_pixel_label", "source_pixel_label"], as_index=False)
+        .size()
+        .rename(columns={"size": "overlap_pixels"})
+    )
+    if overlap_pairs.empty:
+        return []
+
+    mixed_lookup = mixed_cells.loc[:, ["cell_label", "source", "pixel_label", "area"]].rename(
+        columns={
+            "cell_label": "mixed_cell_label",
+            "source": "mixed_source",
+            "pixel_label": "mixed_pixel_label",
+            "area": "mixed_area",
+        }
+    )
+    source_lookup = source_cells.loc[:, ["cell_label", "pixel_label"]].rename(
+        columns={
+            "cell_label": "source_cell_label",
+            "pixel_label": "source_pixel_label",
+        }
+    )
+
+    candidates = overlap_pairs.merge(mixed_lookup, on="mixed_pixel_label", how="inner", sort=False)
+    candidates = candidates.merge(source_lookup, on="source_pixel_label", how="inner", sort=False)
+    if candidates.empty:
+        return []
+
+    candidates["mixed_coverage"] = (
+        candidates["overlap_pixels"].astype(np.float64) / candidates["mixed_area"].astype(np.float64)
+    )
+    candidates = candidates.loc[candidates["mixed_coverage"] >= min_mixed_coverage].copy()
+    if candidates.empty:
+        return []
+
+    candidates["source_dataset"] = source_name
+    return candidates[
+        [
+            "mixed_cell_label",
+            "mixed_source",
+            "source_dataset",
+            "source_cell_label",
+            "mixed_coverage",
+            "overlap_pixels",
+        ]
+    ].to_dict("records")
 
 
 def map_mixed_cells(
+    mixed_labels: np.ndarray,
+    mc_labels: np.ndarray,
+    p5_labels: np.ndarray,
     mixed_cells: pd.DataFrame,
     mc_cells: pd.DataFrame,
     p5_cells: pd.DataFrame,
-    iou_threshold: float,
+    min_mixed_coverage: float,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    candidates = _collect_overlap_candidates(mixed_cells, mc_cells, "MC", iou_threshold)
-    candidates.extend(_collect_overlap_candidates(mixed_cells, p5_cells, "P5", iou_threshold))
+    candidates = _collect_mask_overlap_candidates(
+        mixed_labels=mixed_labels,
+        source_labels=mc_labels,
+        mixed_cells=mixed_cells,
+        source_cells=mc_cells,
+        source_name="MC",
+        min_mixed_coverage=min_mixed_coverage,
+    )
+    candidates.extend(
+        _collect_mask_overlap_candidates(
+            mixed_labels=mixed_labels,
+            source_labels=p5_labels,
+            mixed_cells=mixed_cells,
+            source_cells=p5_cells,
+            source_name="P5",
+            min_mixed_coverage=min_mixed_coverage,
+        )
+    )
     candidates_df = pd.DataFrame(
         candidates,
         columns=[
@@ -409,9 +424,8 @@ def map_mixed_cells(
             "mixed_source",
             "source_dataset",
             "source_cell_label",
-            "iou",
-            "intersection_area",
-            "union_area",
+            "mixed_coverage",
+            "overlap_pixels",
         ],
     )
 
@@ -426,15 +440,15 @@ def map_mixed_cells(
                     "mixed_cell_label": mixed_label,
                     "mapped_source_dataset": "",
                     "mapped_source_label": "",
-                    "mapped_iou": 0.0,
-                    "mapped_intersection_area": 0.0,
+                    "mapped_mixed_coverage": 0.0,
+                    "mapped_overlap_pixels": 0,
                     "is_doublet": False,
                     "doublet_reason": "",
                 }
             )
             continue
         mixed_candidates = mixed_candidates.sort_values(
-            by=["iou", "intersection_area", "source_cell_label"],
+            by=["mixed_coverage", "overlap_pixels", "source_cell_label"],
             ascending=[False, False, True],
         )
         best = mixed_candidates.iloc[0]
@@ -443,10 +457,10 @@ def map_mixed_cells(
                 "mixed_cell_label": mixed_label,
                 "mapped_source_dataset": str(best["source_dataset"]),
                 "mapped_source_label": str(best["source_cell_label"]),
-                "mapped_iou": float(best["iou"]),
-                "mapped_intersection_area": float(best["intersection_area"]),
+                "mapped_mixed_coverage": float(best["mixed_coverage"]),
+                "mapped_overlap_pixels": int(best["overlap_pixels"]),
                 "is_doublet": is_doublet,
-                "doublet_reason": "cross_source_overlap" if is_doublet else "",
+                "doublet_reason": "cross_source_mask_overlap" if is_doublet else "",
             }
         )
     mapping_df = pd.DataFrame(mapping_rows)
@@ -486,25 +500,6 @@ def compute_chip_tile_bounds(
         y0 = min(y0, height - 1)
         y1 = min(height, y0 + 1)
     return x0, y0, x1, y1
-
-
-def select_cells_in_view(cell_df: pd.DataFrame, view_bounds: tuple[int, int, int, int]) -> pd.DataFrame:
-    if cell_df.empty:
-        return cell_df.copy()
-
-    x0, y0, x1, y1 = view_bounds
-    bbox_hits = cell_df.loc[
-        (cell_df["bbox_max_x"] >= x0)
-        & (cell_df["bbox_min_x"] <= x1)
-        & (cell_df["bbox_max_y"] >= y0)
-        & (cell_df["bbox_min_y"] <= y1)
-    ].copy()
-    if bbox_hits.empty:
-        return bbox_hits
-
-    view_polygon = box(x0, y0, x1, y1)
-    intersects = bbox_hits["contour_wkt"].map(lambda value: wkt.loads(str(value)).intersects(view_polygon))
-    return bbox_hits.loc[intersects].copy()
 
 
 def _extract_tile_labels(label_image: np.ndarray, view_bounds: tuple[int, int, int, int]) -> tuple[np.ndarray, set[int]]:
@@ -739,8 +734,8 @@ def build_mapped_h5ad_inputs(
             "mixed_cell_label",
             "mapped_source_dataset",
             "mapped_source_label",
-            "mapped_iou",
-            "mapped_intersection_area",
+            "mapped_mixed_coverage",
+            "mapped_overlap_pixels",
             "is_doublet",
         ]
         empty_obs = pd.DataFrame(columns=obs_columns).set_index("mixed_cell_label", drop=False)
@@ -765,8 +760,8 @@ def build_mapped_h5ad_inputs(
             "mixed_cell_label",
             "mapped_source_dataset",
             "mapped_source_label",
-            "mapped_iou",
-            "mapped_intersection_area",
+            "mapped_mixed_coverage",
+            "mapped_overlap_pixels",
             "is_doublet",
             "doublet_reason",
         ]
@@ -870,7 +865,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cellbin2-entry", type=Path, default=DEFAULT_CELLBIN2_ENTRY)
     parser.add_argument("--cellbin2-template", type=Path, default=DEFAULT_CELLBIN2_TEMPLATE)
     parser.add_argument("--chunk-size", type=int, default=1_000_000)
-    parser.add_argument("--iou-threshold", type=float, default=0.1)
+    parser.add_argument("--min-mixed-coverage", type=float, default=0.1)
     parser.add_argument("--force", action="store_true")
     return parser.parse_args(argv)
 
@@ -878,8 +873,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def validate_args(args: argparse.Namespace) -> None:
     if args.chunk_size < 1:
         raise ValueError("--chunk-size must be >= 1")
-    if args.iou_threshold < 0:
-        raise ValueError("--iou-threshold must be >= 0")
+    if args.min_mixed_coverage < 0:
+        raise ValueError("--min-mixed-coverage must be >= 0")
     for path_value, label in (
         (args.mc_gem, "MC GEM"),
         (args.p5_gem, "P5 GEM"),
@@ -965,10 +960,10 @@ def main(argv: list[str] | None = None) -> int:
     p5_labels = load_final_cell_labels(Path(run_outputs["Y40178P5"]["cell_mask"]))
     mixed_labels = load_final_cell_labels(Path(run_outputs["mixed"]["cell_mask"]))
 
-    log_step("extracting segmented cell polygons")
-    mc_cells = extract_cell_polygons(mc_labels, "MC")
-    p5_cells = extract_cell_polygons(p5_labels, "P5")
-    mixed_cells = extract_cell_polygons(mixed_labels, "mixed")
+    log_step("extracting segmented cell metadata")
+    mc_cells = extract_cell_metadata(mc_labels, "MC")
+    p5_cells = extract_cell_metadata(p5_labels, "P5")
+    mixed_cells = extract_cell_metadata(mixed_labels, "mixed")
 
     log_step("assigning molecules to segmented cells")
     mc_molecules = assign_molecules_to_cells(args.mc_gem, mc_labels, "MC", args.chunk_size)
@@ -977,10 +972,13 @@ def main(argv: list[str] | None = None) -> int:
 
     log_step("mapping mixed cells to source cells")
     candidates_df, mapping_df = map_mixed_cells(
+        mixed_labels=mixed_labels,
+        mc_labels=mc_labels,
+        p5_labels=p5_labels,
         mixed_cells=mixed_cells,
         mc_cells=mc_cells,
         p5_cells=p5_cells,
-        iou_threshold=args.iou_threshold,
+        min_mixed_coverage=args.min_mixed_coverage,
     )
     log_step("filtering doublet molecules")
     filtered_molecules = filter_mixed_doublets(mixed_molecules, mapping_df)
@@ -992,7 +990,7 @@ def main(argv: list[str] | None = None) -> int:
     mc_molecules.to_parquet(args.output_dir / "mc_molecules.parquet", index=False)
     p5_molecules.to_parquet(args.output_dir / "p5_molecules.parquet", index=False)
     mixed_molecules.to_parquet(args.output_dir / "mixed_molecules.parquet", index=False)
-    candidates_df.to_parquet(args.output_dir / "mixed_overlap_candidates.parquet", index=False)
+    candidates_df.to_parquet(args.output_dir / "mixed_mask_overlap_candidates.parquet", index=False)
     mapping_df.to_parquet(args.output_dir / "mixed_cell_mapping.parquet", index=False)
     mapping_df.loc[mapping_df["is_doublet"]].to_parquet(args.output_dir / "mixed_doublets.parquet", index=False)
     write_filtered_mixed_outputs(
