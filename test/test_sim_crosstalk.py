@@ -356,6 +356,338 @@ class MappingRuleTest(unittest.TestCase):
         np.testing.assert_array_equal(mixed_x.toarray(), np.array([[0, 0, 0, 4], [0, 5, 0, 0], [3, 0, 0, 0]]))
         np.testing.assert_array_equal(source_x.toarray(), np.array([[0, 0, 0, 0], [0, 11, 1, 0], [10, 0, 2, 0]]))
 
+    def test_compute_chip_tile_bounds_handles_mixed_and_p5_shapes(self) -> None:
+        self.assertEqual(
+            sim_crosstalk.compute_chip_tile_bounds((23520, 23520), grid_size=20, tile_row=10, tile_col=10),
+            (10584, 10584, 11760, 11760),
+        )
+        self.assertEqual(
+            sim_crosstalk.compute_chip_tile_bounds((23519, 23520), grid_size=20, tile_row=10, tile_col=10),
+            (10584, 10583, 11760, 11759),
+        )
+
+    def test_select_cells_in_view_keeps_polygons_that_cross_tile_boundary(self) -> None:
+        cell_df = make_polygon_frame(
+            [
+                {
+                    "cell_label": "mixed_1",
+                    "source": "mixed",
+                    "pixel_label": 1,
+                    "area": 16,
+                    "bbox_min_x": 8,
+                    "bbox_min_y": 8,
+                    "bbox_max_x": 12,
+                    "bbox_max_y": 12,
+                    "centroid_x": 10.0,
+                    "centroid_y": 10.0,
+                    "contour_wkt": "POLYGON ((8 8, 12 8, 12 12, 8 12, 8 8))",
+                },
+                {
+                    "cell_label": "mixed_2",
+                    "source": "mixed",
+                    "pixel_label": 2,
+                    "area": 16,
+                    "bbox_min_x": 13,
+                    "bbox_min_y": 13,
+                    "bbox_max_x": 17,
+                    "bbox_max_y": 17,
+                    "centroid_x": 15.0,
+                    "centroid_y": 15.0,
+                    "contour_wkt": "POLYGON ((13 13, 17 13, 17 17, 13 17, 13 13))",
+                },
+            ]
+        )
+
+        selected = sim_crosstalk.select_cells_in_view(cell_df, (10, 10, 14, 14))
+
+        self.assertEqual(selected["cell_label"].tolist(), ["mixed_1", "mixed_2"])
+
+    def test_write_spatial_visualization_outputs_png(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            output_path = tmp_path / "spatial_tile_r10_c10.png"
+            mc_labels = np.zeros((23520, 23520), dtype=np.int32)
+            p5_labels = np.zeros((23519, 23520), dtype=np.int32)
+            mixed_labels = np.zeros((23520, 23520), dtype=np.int32)
+            mc_labels[10590:10601, 10590:10601] = 1
+            p5_labels[10589:10600, 10590:10601] = 1
+            mixed_labels[10592:10603, 10592:10603] = 1
+            mixed_labels[10595:10606, 10595:10606] = 2
+
+            mc_cells = make_polygon_frame(
+                [
+                    {
+                        "cell_label": "MC_1",
+                        "source": "MC",
+                        "pixel_label": 1,
+                        "area": 25,
+                        "bbox_min_x": 10590,
+                        "bbox_min_y": 10590,
+                        "bbox_max_x": 10600,
+                        "bbox_max_y": 10600,
+                        "centroid_x": 10595.0,
+                        "centroid_y": 10595.0,
+                        "contour_wkt": "POLYGON ((10590 10590, 10600 10590, 10600 10600, 10590 10600, 10590 10590))",
+                    }
+                ]
+            )
+            p5_cells = make_polygon_frame(
+                [
+                    {
+                        "cell_label": "P5_1",
+                        "source": "P5",
+                        "pixel_label": 1,
+                        "area": 25,
+                        "bbox_min_x": 10590,
+                        "bbox_min_y": 10589,
+                        "bbox_max_x": 10600,
+                        "bbox_max_y": 10599,
+                        "centroid_x": 10595.0,
+                        "centroid_y": 10594.0,
+                        "contour_wkt": "POLYGON ((10590 10589, 10600 10589, 10600 10599, 10590 10599, 10590 10589))",
+                    }
+                ]
+            )
+            mixed_cells = make_polygon_frame(
+                [
+                    {
+                        "cell_label": "mixed_1",
+                        "source": "mixed",
+                        "pixel_label": 1,
+                        "area": 25,
+                        "bbox_min_x": 10592,
+                        "bbox_min_y": 10592,
+                        "bbox_max_x": 10602,
+                        "bbox_max_y": 10602,
+                        "centroid_x": 10597.0,
+                        "centroid_y": 10597.0,
+                        "contour_wkt": "POLYGON ((10592 10592, 10602 10592, 10602 10602, 10592 10602, 10592 10592))",
+                    },
+                    {
+                        "cell_label": "mixed_2",
+                        "source": "mixed",
+                        "pixel_label": 2,
+                        "area": 25,
+                        "bbox_min_x": 10595,
+                        "bbox_min_y": 10595,
+                        "bbox_max_x": 10605,
+                        "bbox_max_y": 10605,
+                        "centroid_x": 10600.0,
+                        "centroid_y": 10600.0,
+                        "contour_wkt": "POLYGON ((10595 10595, 10605 10595, 10605 10605, 10595 10605, 10595 10595))",
+                    },
+                ]
+            )
+            mapping_df = pd.DataFrame(
+                [
+                    {
+                        "mixed_cell_label": "mixed_1",
+                        "mapped_source_dataset": "MC",
+                        "mapped_source_label": "MC_1",
+                        "mapped_iou": 0.9,
+                        "mapped_intersection_area": 10.0,
+                        "is_doublet": False,
+                        "doublet_reason": "",
+                    },
+                    {
+                        "mixed_cell_label": "mixed_2",
+                        "mapped_source_dataset": "P5",
+                        "mapped_source_label": "P5_1",
+                        "mapped_iou": 0.8,
+                        "mapped_intersection_area": 9.0,
+                        "is_doublet": True,
+                        "doublet_reason": "cross_source_overlap",
+                    },
+                ]
+            )
+
+            result = sim_crosstalk.write_spatial_visualization(
+                output_path=output_path,
+                mc_cells=mc_cells,
+                p5_cells=p5_cells,
+                mixed_cells=mixed_cells,
+                mapping_df=mapping_df,
+                mc_labels=mc_labels,
+                p5_labels=p5_labels,
+                mixed_labels=mixed_labels,
+            )
+
+            self.assertEqual(result, output_path)
+            self.assertTrue(output_path.exists())
+            self.assertGreater(output_path.stat().st_size, 0)
+
+    def test_write_spatial_visualization_accepts_multipolygon_cells(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            output_path = tmp_path / "spatial_tile_r10_c10.png"
+            mc_labels = np.zeros((23520, 23520), dtype=np.int32)
+            p5_labels = np.zeros((23519, 23520), dtype=np.int32)
+            mixed_labels = np.zeros((23520, 23520), dtype=np.int32)
+            mc_labels[10590:10606, 10590:10606] = 1
+            mixed_labels[10592:10603, 10592:10603] = 1
+
+            mc_cells = make_polygon_frame(
+                [
+                    {
+                        "cell_label": "MC_1",
+                        "source": "MC",
+                        "pixel_label": 1,
+                        "area": 20,
+                        "bbox_min_x": 10590,
+                        "bbox_min_y": 10590,
+                        "bbox_max_x": 10605,
+                        "bbox_max_y": 10605,
+                        "centroid_x": 10597.5,
+                        "centroid_y": 10597.5,
+                        "contour_wkt": (
+                            "MULTIPOLYGON (((10590 10590, 10595 10590, 10595 10595, 10590 10595, 10590 10590)), "
+                            "((10600 10600, 10605 10600, 10605 10605, 10600 10605, 10600 10600)))"
+                        ),
+                    }
+                ]
+            )
+            p5_cells = pd.DataFrame(columns=sim_crosstalk.CELL_COLUMNS)
+            mixed_cells = make_polygon_frame(
+                [
+                    {
+                        "cell_label": "mixed_1",
+                        "source": "mixed",
+                        "pixel_label": 1,
+                        "area": 25,
+                        "bbox_min_x": 10592,
+                        "bbox_min_y": 10592,
+                        "bbox_max_x": 10602,
+                        "bbox_max_y": 10602,
+                        "centroid_x": 10597.0,
+                        "centroid_y": 10597.0,
+                        "contour_wkt": "POLYGON ((10592 10592, 10602 10592, 10602 10602, 10592 10602, 10592 10592))",
+                    }
+                ]
+            )
+            mapping_df = pd.DataFrame(
+                [
+                    {
+                        "mixed_cell_label": "mixed_1",
+                        "mapped_source_dataset": "MC",
+                        "mapped_source_label": "MC_1",
+                        "mapped_iou": 0.9,
+                        "mapped_intersection_area": 10.0,
+                        "is_doublet": False,
+                        "doublet_reason": "",
+                    }
+                ]
+            )
+
+            result = sim_crosstalk.write_spatial_visualization(
+                output_path=output_path,
+                mc_cells=mc_cells,
+                p5_cells=p5_cells,
+                mixed_cells=mixed_cells,
+                mapping_df=mapping_df,
+                mc_labels=mc_labels,
+                p5_labels=p5_labels,
+                mixed_labels=mixed_labels,
+            )
+
+            self.assertEqual(result, output_path)
+            self.assertTrue(output_path.exists())
+            self.assertGreater(output_path.stat().st_size, 0)
+
+    def test_write_spatial_visualization_uses_mixed_view_for_mapped_source_panel(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            output_path = tmp_path / "spatial_tile_r2_c2.png"
+
+            mc_labels = np.zeros((20, 20), dtype=np.int32)
+            p5_labels = np.zeros((19, 20), dtype=np.int32)
+            mixed_labels = np.zeros((20, 20), dtype=np.int32)
+            mixed_labels[12:15, 12:15] = 1
+            p5_labels[15:19, 14:18] = 7
+
+            mc_cells = pd.DataFrame(columns=sim_crosstalk.CELL_COLUMNS)
+            p5_cells = make_polygon_frame(
+                [
+                    {
+                        "cell_label": "P5_7",
+                        "source": "P5",
+                        "pixel_label": 7,
+                        "area": 16,
+                        "bbox_min_x": 14,
+                        "bbox_min_y": 15,
+                        "bbox_max_x": 17,
+                        "bbox_max_y": 18,
+                        "centroid_x": 15.5,
+                        "centroid_y": 16.5,
+                        "contour_wkt": "POLYGON ((14 15, 18 15, 18 19, 14 19, 14 15))",
+                    }
+                ]
+            )
+            mixed_cells = make_polygon_frame(
+                [
+                    {
+                        "cell_label": "mixed_1",
+                        "source": "mixed",
+                        "pixel_label": 1,
+                        "area": 9,
+                        "bbox_min_x": 12,
+                        "bbox_min_y": 12,
+                        "bbox_max_x": 14,
+                        "bbox_max_y": 14,
+                        "centroid_x": 13.0,
+                        "centroid_y": 13.0,
+                        "contour_wkt": "POLYGON ((12 12, 15 12, 15 15, 12 15, 12 12))",
+                    }
+                ]
+            )
+            mapping_df = pd.DataFrame(
+                [
+                    {
+                        "mixed_cell_label": "mixed_1",
+                        "mapped_source_dataset": "P5",
+                        "mapped_source_label": "P5_7",
+                        "mapped_iou": 0.8,
+                        "mapped_intersection_area": 5.0,
+                        "is_doublet": False,
+                        "doublet_reason": "",
+                    }
+                ]
+            )
+
+            captured: dict[str, object] = {}
+            original_render_source = sim_crosstalk._render_source_mask_panel
+
+            def capture_render_source(ax, mc_tile, p5_tile, view_bounds, title):
+                captured["mc_shape"] = mc_tile.shape
+                captured["p5_shape"] = p5_tile.shape
+                captured["view_bounds"] = view_bounds
+                captured["mc_labels"] = set(np.unique(mc_tile).tolist())
+                captured["p5_labels"] = set(np.unique(p5_tile).tolist())
+                return original_render_source(ax, mc_tile, p5_tile, view_bounds, title)
+
+            try:
+                sim_crosstalk._render_source_mask_panel = capture_render_source
+                sim_crosstalk.write_spatial_visualization(
+                    output_path=output_path,
+                    mc_cells=mc_cells,
+                    p5_cells=p5_cells,
+                    mixed_cells=mixed_cells,
+                    mapping_df=mapping_df,
+                    mc_labels=mc_labels,
+                    p5_labels=p5_labels,
+                    mixed_labels=mixed_labels,
+                    grid_size=2,
+                    tile_row=2,
+                    tile_col=2,
+                )
+            finally:
+                sim_crosstalk._render_source_mask_panel = original_render_source
+
+            self.assertEqual(captured["view_bounds"], (10, 10, 20, 20))
+            self.assertEqual(captured["mc_shape"], (10, 10))
+            self.assertEqual(captured["p5_shape"], (10, 10))
+            self.assertEqual(captured["mc_labels"], {0})
+            self.assertEqual(captured["p5_labels"], {0, 7})
+
 
 class MainFlowTest(unittest.TestCase):
     def test_main_runs_cellbin2_pipeline_with_mocked_runner(self) -> None:
@@ -479,6 +811,7 @@ class MainFlowTest(unittest.TestCase):
             self.assertIn("source", mapped_h5ad.layers.keys())
             self.assertEqual(list(mapped_h5ad.obs["mixed_cell_label"]), ["mixed_1", "mixed_2"])
             self.assertEqual(mapped_h5ad.X.shape, mapped_h5ad.layers["source"].shape)
+            self.assertTrue((output_dir / "spatial_tile_r10_c10.png").exists())
 
     def test_main_reuses_existing_mixed_gem_gef_and_cellbin2_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -669,6 +1002,7 @@ class NotebookFlowTest(unittest.TestCase):
         self.assertIn("sim_crosstalk.ensure_output_dir(output_dir, force=force_rerun)", joined_sources)
         self.assertIn("if sample_name not in run_outputs", joined_sources)
         self.assertIn("sim_crosstalk.get_run_output", joined_sources)
+        self.assertIn("sim_crosstalk.write_spatial_visualization", joined_sources)
         for helper_name in [
             "sim_crosstalk.build_mixed_gem",
             "sim_crosstalk.prepare_cellbin2_config",

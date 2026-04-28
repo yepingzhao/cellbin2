@@ -13,9 +13,11 @@ from pathlib import Path
 from typing import Iterator
 
 import anndata as ad
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import tifffile
+from matplotlib.colors import to_rgb
 from scipy import sparse
 from shapely import wkt
 from shapely.geometry import Polygon
@@ -45,6 +47,17 @@ CELL_COLUMNS = [
     "centroid_y",
     "contour_wkt",
 ]
+DEFAULT_TILE_GRID_SIZE = 20
+DEFAULT_TILE_ROW = 10
+DEFAULT_TILE_COL = 10
+DEFAULT_SPATIAL_TILE_FILENAME = f"spatial_tile_r{DEFAULT_TILE_ROW}_c{DEFAULT_TILE_COL}.png"
+PANEL_COLORS = {
+    "MC": "#1b9e77",
+    "P5": "#d95f02",
+    "mixed_before": "#9e9e9e",
+    "mixed_after": "#4c78a8",
+    "mapped_mixed": "#2a9d8f",
+}
 
 
 def log_step(message: str) -> None:
@@ -447,6 +460,227 @@ def filter_mixed_doublets(molecules: pd.DataFrame, mapping_df: pd.DataFrame) -> 
     return molecules.loc[~molecules["cell_label"].isin(drop_labels)].copy()
 
 
+def compute_chip_tile_bounds(
+    mask_shape: tuple[int, int],
+    grid_size: int = DEFAULT_TILE_GRID_SIZE,
+    tile_row: int = DEFAULT_TILE_ROW,
+    tile_col: int = DEFAULT_TILE_COL,
+) -> tuple[int, int, int, int]:
+    height, width = mask_shape
+    if grid_size < 1:
+        raise ValueError("grid_size must be >= 1")
+    if tile_row < 1 or tile_row > grid_size or tile_col < 1 or tile_col > grid_size:
+        raise ValueError("tile_row and tile_col must be within 1..grid_size")
+
+    x_edges = np.linspace(0, width, grid_size + 1, dtype=int)
+    y_edges = np.linspace(0, height, grid_size + 1, dtype=int)
+    x0 = int(x_edges[tile_col - 1])
+    x1 = int(x_edges[tile_col])
+    y0 = int(y_edges[tile_row - 1])
+    y1 = int(y_edges[tile_row])
+
+    if width > 0 and x1 <= x0:
+        x0 = min(x0, width - 1)
+        x1 = min(width, x0 + 1)
+    if height > 0 and y1 <= y0:
+        y0 = min(y0, height - 1)
+        y1 = min(height, y0 + 1)
+    return x0, y0, x1, y1
+
+
+def select_cells_in_view(cell_df: pd.DataFrame, view_bounds: tuple[int, int, int, int]) -> pd.DataFrame:
+    if cell_df.empty:
+        return cell_df.copy()
+
+    x0, y0, x1, y1 = view_bounds
+    bbox_hits = cell_df.loc[
+        (cell_df["bbox_max_x"] >= x0)
+        & (cell_df["bbox_min_x"] <= x1)
+        & (cell_df["bbox_max_y"] >= y0)
+        & (cell_df["bbox_min_y"] <= y1)
+    ].copy()
+    if bbox_hits.empty:
+        return bbox_hits
+
+    view_polygon = box(x0, y0, x1, y1)
+    intersects = bbox_hits["contour_wkt"].map(lambda value: wkt.loads(str(value)).intersects(view_polygon))
+    return bbox_hits.loc[intersects].copy()
+
+
+def _extract_tile_labels(label_image: np.ndarray, view_bounds: tuple[int, int, int, int]) -> tuple[np.ndarray, set[int]]:
+    tile = _extract_view_tile(label_image, view_bounds)
+    labels = set(np.unique(tile).tolist())
+    labels.discard(0)
+    return tile, {int(value) for value in labels}
+
+
+def _extract_view_tile(
+    label_image: np.ndarray,
+    view_bounds: tuple[int, int, int, int],
+    *,
+    target_shape: tuple[int, int] | None = None,
+) -> np.ndarray:
+    x0, y0, x1, y1 = view_bounds
+    view_height = max(0, y1 - y0)
+    view_width = max(0, x1 - x0)
+    if target_shape is None:
+        target_shape = (view_height, view_width)
+
+    tile = np.zeros(target_shape, dtype=label_image.dtype)
+    src_x0 = max(0, x0)
+    src_y0 = max(0, y0)
+    src_x1 = min(label_image.shape[1], x1)
+    src_y1 = min(label_image.shape[0], y1)
+    if src_x1 <= src_x0 or src_y1 <= src_y0:
+        return tile
+
+    dst_x0 = src_x0 - x0
+    dst_y0 = src_y0 - y0
+    dst_x1 = dst_x0 + (src_x1 - src_x0)
+    dst_y1 = dst_y0 + (src_y1 - src_y0)
+    tile[dst_y0:dst_y1, dst_x0:dst_x1] = label_image[src_y0:src_y1, src_x0:src_x1]
+    return tile
+
+
+def _filter_tile_by_labels(tile: np.ndarray, allowed_labels: set[int] | None) -> np.ndarray:
+    if allowed_labels is None:
+        return tile.copy()
+    if not allowed_labels:
+        return np.zeros_like(tile)
+    filtered = tile.copy()
+    filtered[~np.isin(filtered, list(allowed_labels))] = 0
+    return filtered
+
+
+def _lookup_pixel_labels(cell_df: pd.DataFrame, cell_labels: set[str]) -> set[int]:
+    if cell_df.empty or not cell_labels:
+        return set()
+    matched = cell_df.loc[cell_df["cell_label"].isin(cell_labels), "pixel_label"].tolist()
+    return {int(value) for value in matched}
+
+
+def _render_single_mask_panel(
+    ax: plt.Axes,
+    label_tile: np.ndarray,
+    view_bounds: tuple[int, int, int, int],
+    title: str,
+    color: str,
+) -> None:
+    x0, y0, x1, y1 = view_bounds
+    rgb = np.ones((label_tile.shape[0], label_tile.shape[1], 3), dtype=np.float32)
+    rgb[label_tile > 0] = np.asarray(to_rgb(color), dtype=np.float32)
+    ax.imshow(rgb, extent=(x0, x1, y1, y0), interpolation="nearest")
+    ax.set_title(f"{title}\n{len(np.unique(label_tile[label_tile > 0]))} cells", fontsize=11)
+    ax.set_xlim(x0, x1)
+    ax.set_ylim(y1, y0)
+    ax.set_aspect("equal")
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.grid(False)
+
+
+def _render_source_mask_panel(
+    ax: plt.Axes,
+    mc_tile: np.ndarray,
+    p5_tile: np.ndarray,
+    view_bounds: tuple[int, int, int, int],
+    title: str,
+) -> None:
+    x0, y0, x1, y1 = view_bounds
+    rgb = np.ones((mc_tile.shape[0], mc_tile.shape[1], 3), dtype=np.float32)
+    mc_color = np.asarray(to_rgb(PANEL_COLORS["MC"]), dtype=np.float32)
+    p5_color = np.asarray(to_rgb(PANEL_COLORS["P5"]), dtype=np.float32)
+    mc_mask = mc_tile > 0
+    p5_mask = p5_tile > 0
+    rgb[mc_mask] = mc_color
+    rgb[p5_mask] = p5_color
+    overlap = mc_mask & p5_mask
+    if np.any(overlap):
+        rgb[overlap] = (mc_color + p5_color) / 2.0
+
+    ax.imshow(rgb, extent=(x0, x1, y1, y0), interpolation="nearest")
+    cell_count = len(np.unique(mc_tile[mc_tile > 0])) + len(np.unique(p5_tile[p5_tile > 0]))
+    ax.set_title(f"{title}\n{cell_count} cells", fontsize=11)
+    ax.set_xlim(x0, x1)
+    ax.set_ylim(y1, y0)
+    ax.set_aspect("equal")
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.grid(False)
+
+
+def write_spatial_visualization(
+    output_path: Path,
+    mc_cells: pd.DataFrame,
+    p5_cells: pd.DataFrame,
+    mixed_cells: pd.DataFrame,
+    mapping_df: pd.DataFrame,
+    mc_labels: np.ndarray,
+    p5_labels: np.ndarray,
+    mixed_labels: np.ndarray,
+    *,
+    grid_size: int = DEFAULT_TILE_GRID_SIZE,
+    tile_row: int = DEFAULT_TILE_ROW,
+    tile_col: int = DEFAULT_TILE_COL,
+) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    mc_view = compute_chip_tile_bounds(mc_labels.shape, grid_size=grid_size, tile_row=tile_row, tile_col=tile_col)
+    p5_view = compute_chip_tile_bounds(p5_labels.shape, grid_size=grid_size, tile_row=tile_row, tile_col=tile_col)
+    mixed_view = compute_chip_tile_bounds(mixed_labels.shape, grid_size=grid_size, tile_row=tile_row, tile_col=tile_col)
+
+    doublet_labels = set(mapping_df.loc[mapping_df["is_doublet"], "mixed_cell_label"].tolist())
+    mapped_rows = mapping_df.loc[
+            (~mapping_df["is_doublet"])
+            & mapping_df["mapped_source_dataset"].ne("")
+            & mapping_df["mapped_source_label"].ne(""),
+    ].copy()
+    mapped_labels = set(mapped_rows["mixed_cell_label"].tolist())
+
+    mc_tile, _ = _extract_tile_labels(mc_labels, mc_view)
+    p5_tile, _ = _extract_tile_labels(p5_labels, p5_view)
+    mixed_tile, mixed_tile_pixel_labels = _extract_tile_labels(mixed_labels, mixed_view)
+    mixed_tile_label_names = {f"mixed_{value}" for value in mixed_tile_pixel_labels}
+
+    doublet_pixel_labels = _lookup_pixel_labels(mixed_cells, doublet_labels)
+    mapped_pixel_labels = _lookup_pixel_labels(mixed_cells, mapped_labels)
+    mixed_after_tile = _filter_tile_by_labels(mixed_tile, mixed_tile_pixel_labels - doublet_pixel_labels)
+    mapped_mixed_tile = _filter_tile_by_labels(mixed_tile, mixed_tile_pixel_labels & mapped_pixel_labels)
+
+    selected_mapped_rows = mapped_rows.loc[mapped_rows["mixed_cell_label"].isin(mixed_tile_label_names)].copy()
+    mc_source_labels = set(
+        selected_mapped_rows.loc[selected_mapped_rows["mapped_source_dataset"] == "MC", "mapped_source_label"].tolist()
+    )
+    p5_source_labels = set(
+        selected_mapped_rows.loc[selected_mapped_rows["mapped_source_dataset"] == "P5", "mapped_source_label"].tolist()
+    )
+    mc_source_pixels = _lookup_pixel_labels(mc_cells, mc_source_labels)
+    p5_source_pixels = _lookup_pixel_labels(p5_cells, p5_source_labels)
+    source_target_shape = mixed_tile.shape
+    mc_source_tile = _filter_tile_by_labels(
+        _extract_view_tile(mc_labels, mixed_view, target_shape=source_target_shape),
+        mc_source_pixels,
+    )
+    p5_source_tile = _filter_tile_by_labels(
+        _extract_view_tile(p5_labels, mixed_view, target_shape=source_target_shape),
+        p5_source_pixels,
+    )
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    _render_single_mask_panel(axes[0, 0], mc_tile, mc_view, f"MC tile ({tile_row},{tile_col})", PANEL_COLORS["MC"])
+    _render_single_mask_panel(axes[0, 1], p5_tile, p5_view, f"P5 tile ({tile_row},{tile_col})", PANEL_COLORS["P5"])
+    _render_single_mask_panel(axes[0, 2], mixed_tile, mixed_view, f"mixed before doublet tile ({tile_row},{tile_col})", PANEL_COLORS["mixed_before"])
+    _render_single_mask_panel(axes[1, 0], mixed_after_tile, mixed_view, f"mixed after doublet tile ({tile_row},{tile_col})", PANEL_COLORS["mixed_after"])
+    _render_single_mask_panel(axes[1, 1], mapped_mixed_tile, mixed_view, f"mapped mixed tile ({tile_row},{tile_col})", PANEL_COLORS["mapped_mixed"])
+    _render_source_mask_panel(axes[1, 2], mc_source_tile, p5_source_tile, mixed_view, f"mapped source tile ({tile_row},{tile_col})")
+
+    fig.suptitle("Spatial cell visualization", fontsize=14)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return output_path
+
+
 def write_filtered_mixed_outputs(
     molecules: pd.DataFrame,
     output_gem: Path,
@@ -781,6 +1015,18 @@ def main(argv: list[str] | None = None) -> int:
         gene_order=gene_order,
         mixed_x=mixed_x,
         source_x=source_x,
+    )
+    spatial_tile_path = args.output_dir / DEFAULT_SPATIAL_TILE_FILENAME
+    log_step(f"writing spatial visualization: {spatial_tile_path}")
+    write_spatial_visualization(
+        output_path=spatial_tile_path,
+        mc_cells=mc_cells,
+        p5_cells=p5_cells,
+        mixed_cells=mixed_cells,
+        mapping_df=mapping_df,
+        mc_labels=mc_labels,
+        p5_labels=p5_labels,
+        mixed_labels=mixed_labels,
     )
     log_step("writing summary.json")
     write_summary(
