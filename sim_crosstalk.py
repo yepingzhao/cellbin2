@@ -432,46 +432,77 @@ def map_mixed_cells(
     mapping_rows: list[dict[str, object]] = []
     for mixed_label in mixed_cells["cell_label"].tolist():
         mixed_candidates = candidates_df.loc[candidates_df["mixed_cell_label"] == mixed_label].copy()
-        source_datasets = sorted(mixed_candidates["source_dataset"].unique().tolist()) if not mixed_candidates.empty else []
-        is_doublet = len(source_datasets) > 1
         if mixed_candidates.empty:
             mapping_rows.append(
                 {
                     "mixed_cell_label": mixed_label,
                     "mapped_source_dataset": "",
                     "mapped_source_label": "",
+                    "mapped_source_datasets": "",
+                    "mapped_source_labels": "",
+                    "mapped_source_count": 0,
                     "mapped_mixed_coverage": 0.0,
                     "mapped_overlap_pixels": 0,
                     "is_doublet": False,
+                    "is_multiplet": False,
                     "doublet_reason": "",
                 }
             )
             continue
         mixed_candidates = mixed_candidates.sort_values(
-            by=["mixed_coverage", "overlap_pixels", "source_cell_label"],
-            ascending=[False, False, True],
+            by=["mixed_coverage", "overlap_pixels", "source_dataset", "source_cell_label"],
+            ascending=[False, False, True, True],
         )
         best = mixed_candidates.iloc[0]
+        source_datasets = sorted(mixed_candidates["source_dataset"].unique().tolist())
+        source_labels = mixed_candidates["source_cell_label"].astype(str).tolist()
+        source_count = len(source_labels)
+        is_multiplet = source_count >= 2
         mapping_rows.append(
             {
                 "mixed_cell_label": mixed_label,
                 "mapped_source_dataset": str(best["source_dataset"]),
                 "mapped_source_label": str(best["source_cell_label"]),
+                "mapped_source_datasets": ";".join(str(value) for value in source_datasets),
+                "mapped_source_labels": ";".join(source_labels),
+                "mapped_source_count": source_count,
                 "mapped_mixed_coverage": float(best["mixed_coverage"]),
                 "mapped_overlap_pixels": int(best["overlap_pixels"]),
-                "is_doublet": is_doublet,
-                "doublet_reason": "cross_source_mask_overlap" if is_doublet else "",
+                "is_doublet": is_multiplet,
+                "is_multiplet": is_multiplet,
+                "doublet_reason": "multi_source_mask_overlap" if is_multiplet else "",
             }
         )
-    mapping_df = pd.DataFrame(mapping_rows)
+    mapping_df = pd.DataFrame(
+        mapping_rows,
+        columns=[
+            "mixed_cell_label",
+            "mapped_source_dataset",
+            "mapped_source_label",
+            "mapped_source_datasets",
+            "mapped_source_labels",
+            "mapped_source_count",
+            "mapped_mixed_coverage",
+            "mapped_overlap_pixels",
+            "is_doublet",
+            "is_multiplet",
+            "doublet_reason",
+        ],
+    )
     return candidates_df, mapping_df
 
 
-def filter_mixed_doublets(molecules: pd.DataFrame, mapping_df: pd.DataFrame) -> pd.DataFrame:
-    drop_labels = set(mapping_df.loc[mapping_df["is_doublet"], "mixed_cell_label"].tolist())
-    if not drop_labels:
-        return molecules.copy()
-    return molecules.loc[~molecules["cell_label"].isin(drop_labels)].copy()
+def select_multiplet_molecules(molecules: pd.DataFrame, mapping_df: pd.DataFrame) -> pd.DataFrame:
+    target_labels = set(mapping_df.loc[mapping_df["is_multiplet"], "mixed_cell_label"].tolist())
+    if not target_labels:
+        return molecules.iloc[0:0].copy()
+    return molecules.loc[molecules["cell_label"].isin(target_labels)].copy()
+
+
+def _split_label_list(value: object) -> list[str]:
+    if value is None or pd.isna(value):
+        return []
+    return [label for label in str(value).split(";") if label]
 
 
 def compute_chip_tile_bounds(
@@ -624,31 +655,28 @@ def write_spatial_visualization(
     p5_view = compute_chip_tile_bounds(p5_labels.shape, grid_size=grid_size, tile_row=tile_row, tile_col=tile_col)
     mixed_view = compute_chip_tile_bounds(mixed_labels.shape, grid_size=grid_size, tile_row=tile_row, tile_col=tile_col)
 
-    doublet_labels = set(mapping_df.loc[mapping_df["is_doublet"], "mixed_cell_label"].tolist())
-    mapped_rows = mapping_df.loc[
-            (~mapping_df["is_doublet"])
-            & mapping_df["mapped_source_dataset"].ne("")
-            & mapping_df["mapped_source_label"].ne(""),
+    target_rows = mapping_df.loc[
+        mapping_df["is_multiplet"] & mapping_df["mapped_source_labels"].ne("")
     ].copy()
-    mapped_labels = set(mapped_rows["mixed_cell_label"].tolist())
+    target_labels = set(target_rows["mixed_cell_label"].tolist())
 
     mc_tile, _ = _extract_tile_labels(mc_labels, mc_view)
     p5_tile, _ = _extract_tile_labels(p5_labels, p5_view)
     mixed_tile, mixed_tile_pixel_labels = _extract_tile_labels(mixed_labels, mixed_view)
     mixed_tile_label_names = {f"mixed_{value}" for value in mixed_tile_pixel_labels}
 
-    doublet_pixel_labels = _lookup_pixel_labels(mixed_cells, doublet_labels)
-    mapped_pixel_labels = _lookup_pixel_labels(mixed_cells, mapped_labels)
-    mixed_after_tile = _filter_tile_by_labels(mixed_tile, mixed_tile_pixel_labels - doublet_pixel_labels)
-    mapped_mixed_tile = _filter_tile_by_labels(mixed_tile, mixed_tile_pixel_labels & mapped_pixel_labels)
+    target_pixel_labels = _lookup_pixel_labels(mixed_cells, target_labels)
+    target_mixed_tile = _filter_tile_by_labels(mixed_tile, mixed_tile_pixel_labels & target_pixel_labels)
+    mapped_multiplet_tile = _filter_tile_by_labels(mixed_tile, mixed_tile_pixel_labels & target_pixel_labels)
 
-    selected_mapped_rows = mapped_rows.loc[mapped_rows["mixed_cell_label"].isin(mixed_tile_label_names)].copy()
-    mc_source_labels = set(
-        selected_mapped_rows.loc[selected_mapped_rows["mapped_source_dataset"] == "MC", "mapped_source_label"].tolist()
-    )
-    p5_source_labels = set(
-        selected_mapped_rows.loc[selected_mapped_rows["mapped_source_dataset"] == "P5", "mapped_source_label"].tolist()
-    )
+    selected_target_rows = target_rows.loc[target_rows["mixed_cell_label"].isin(mixed_tile_label_names)].copy()
+    selected_source_labels = {
+        label
+        for labels in selected_target_rows["mapped_source_labels"].tolist()
+        for label in _split_label_list(labels)
+    }
+    mc_source_labels = {label for label in selected_source_labels if label.startswith("MC_")}
+    p5_source_labels = {label for label in selected_source_labels if label.startswith("P5_")}
     mc_source_pixels = _lookup_pixel_labels(mc_cells, mc_source_labels)
     p5_source_pixels = _lookup_pixel_labels(p5_cells, p5_source_labels)
     source_target_shape = mixed_tile.shape
@@ -664,10 +692,10 @@ def write_spatial_visualization(
     fig, axes = plt.subplots(2, 3, figsize=(18, 12))
     _render_single_mask_panel(axes[0, 0], mc_tile, mc_view, f"MC tile ({tile_row},{tile_col})", PANEL_COLORS["MC"])
     _render_single_mask_panel(axes[0, 1], p5_tile, p5_view, f"P5 tile ({tile_row},{tile_col})", PANEL_COLORS["P5"])
-    _render_single_mask_panel(axes[0, 2], mixed_tile, mixed_view, f"mixed before doublet tile ({tile_row},{tile_col})", PANEL_COLORS["mixed_before"])
-    _render_single_mask_panel(axes[1, 0], mixed_after_tile, mixed_view, f"mixed after doublet tile ({tile_row},{tile_col})", PANEL_COLORS["mixed_after"])
-    _render_single_mask_panel(axes[1, 1], mapped_mixed_tile, mixed_view, f"mapped mixed tile ({tile_row},{tile_col})", PANEL_COLORS["mapped_mixed"])
-    _render_source_mask_panel(axes[1, 2], mc_source_tile, p5_source_tile, mixed_view, f"mapped source tile ({tile_row},{tile_col})")
+    _render_single_mask_panel(axes[0, 2], mixed_tile, mixed_view, f"mixed all cells tile ({tile_row},{tile_col})", PANEL_COLORS["mixed_before"])
+    _render_single_mask_panel(axes[1, 0], target_mixed_tile, mixed_view, f"mixed multiplet targets tile ({tile_row},{tile_col})", PANEL_COLORS["mixed_after"])
+    _render_single_mask_panel(axes[1, 1], mapped_multiplet_tile, mixed_view, f"mapped multiplet mixed tile ({tile_row},{tile_col})", PANEL_COLORS["mapped_mixed"])
+    _render_source_mask_panel(axes[1, 2], mc_source_tile, p5_source_tile, mixed_view, f"multiplet source tile ({tile_row},{tile_col})")
 
     fig.suptitle("Spatial cell visualization", fontsize=14)
     fig.tight_layout()
@@ -676,7 +704,7 @@ def write_spatial_visualization(
     return output_path
 
 
-def write_filtered_mixed_outputs(
+def write_mixed_molecule_outputs(
     molecules: pd.DataFrame,
     output_gem: Path,
     output_parquet: Path,
@@ -719,67 +747,88 @@ def build_cell_gene_matrix(
 
 def build_mapped_h5ad_inputs(
     mixed_cells: pd.DataFrame,
-    filtered_molecules: pd.DataFrame,
+    target_molecules: pd.DataFrame,
     mapping_df: pd.DataFrame,
     mc_molecules: pd.DataFrame,
     p5_molecules: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.Index, sparse.csr_matrix, sparse.csr_matrix]:
-    kept_mapping = mapping_df.loc[
-        (~mapping_df["is_doublet"])
-        & mapping_df["mapped_source_dataset"].ne("")
-        & mapping_df["mapped_source_label"].ne("")
+    target_mapping = mapping_df.loc[
+        mapping_df["is_multiplet"] & mapping_df["mapped_source_labels"].ne("")
     ].copy()
-    if kept_mapping.empty:
+    obs_columns = [
+        "mixed_cell_label",
+        "mapped_source_dataset",
+        "mapped_source_label",
+        "mapped_source_datasets",
+        "mapped_source_labels",
+        "mapped_source_count",
+        "mapped_mixed_coverage",
+        "mapped_overlap_pixels",
+        "is_multiplet",
+        "is_doublet",
+        "doublet_reason",
+    ]
+    if target_mapping.empty:
+        empty_obs = pd.DataFrame(columns=obs_columns).set_index("mixed_cell_label", drop=False)
+        empty_genes = pd.Index([], dtype="object")
+        empty_matrix = sparse.csr_matrix((0, 0), dtype=np.int32)
+        return empty_obs, empty_genes, empty_matrix, empty_matrix
+
+    target_labels = set(target_mapping["mixed_cell_label"].tolist())
+    mixed_order = mixed_cells.loc[
+        mixed_cells["cell_label"].isin(target_labels),
+        "cell_label",
+    ].tolist()
+    if not mixed_order:
+        empty_obs = pd.DataFrame(columns=obs_columns).set_index("mixed_cell_label", drop=False)
+        empty_genes = pd.Index([], dtype="object")
+        empty_matrix = sparse.csr_matrix((0, 0), dtype=np.int32)
+        return empty_obs, empty_genes, empty_matrix, empty_matrix
+
+    target_mapping["mixed_cell_label"] = pd.Categorical(
+        target_mapping["mixed_cell_label"],
+        categories=mixed_order,
+        ordered=True,
+    )
+    obs_df = target_mapping.sort_values("mixed_cell_label").copy()
+    obs_df["mixed_cell_label"] = obs_df["mixed_cell_label"].astype(str)
+    obs_df = obs_df[obs_columns].set_index("mixed_cell_label", drop=False)
+
+    source_map_rows = [
+        {
+            "mixed_cell_label": str(row.mixed_cell_label),
+            "source_cell_label": str(row.mapped_source_label),
+        }
+        for row in obs_df.loc[:, ["mixed_cell_label", "mapped_source_label"]].itertuples(index=False)
+        if str(row.mapped_source_label)
+    ]
+
+    if not source_map_rows:
         obs_columns = [
             "mixed_cell_label",
             "mapped_source_dataset",
             "mapped_source_label",
+            "mapped_source_datasets",
+            "mapped_source_labels",
+            "mapped_source_count",
             "mapped_mixed_coverage",
             "mapped_overlap_pixels",
+            "is_multiplet",
             "is_doublet",
+            "doublet_reason",
         ]
         empty_obs = pd.DataFrame(columns=obs_columns).set_index("mixed_cell_label", drop=False)
         empty_genes = pd.Index([], dtype="object")
         empty_matrix = sparse.csr_matrix((0, 0), dtype=np.int32)
         return empty_obs, empty_genes, empty_matrix, empty_matrix
 
-    kept_labels = set(kept_mapping["mixed_cell_label"].tolist())
-    mixed_order = mixed_cells.loc[
-        mixed_cells["cell_label"].isin(kept_labels),
-        "cell_label",
-    ].tolist()
-    kept_mapping["mixed_cell_label"] = pd.Categorical(
-        kept_mapping["mixed_cell_label"],
-        categories=mixed_order,
-        ordered=True,
-    )
-    obs_df = kept_mapping.sort_values("mixed_cell_label").copy()
-    obs_df["mixed_cell_label"] = obs_df["mixed_cell_label"].astype(str)
-    obs_df = obs_df[
-        [
-            "mixed_cell_label",
-            "mapped_source_dataset",
-            "mapped_source_label",
-            "mapped_mixed_coverage",
-            "mapped_overlap_pixels",
-            "is_doublet",
-            "doublet_reason",
-        ]
-    ].set_index("mixed_cell_label", drop=False)
-
+    source_map_df = pd.DataFrame(source_map_rows)
     source_frames: list[pd.DataFrame] = []
-    for dataset_name, source_frame in (("MC", mc_molecules), ("P5", p5_molecules)):
-        dataset_mapping = obs_df.loc[
-            obs_df["mapped_source_dataset"] == dataset_name,
-            ["mixed_cell_label", "mapped_source_label"],
-        ].copy()
-        if dataset_mapping.empty:
-            continue
-
+    for source_frame in (mc_molecules, p5_molecules):
         matched = source_frame.loc[:, ["cell_label", "geneID", "MIDCount"]].merge(
-            dataset_mapping,
+            source_map_df,
             left_on="cell_label",
-            right_on="mapped_source_label",
+            right_on="source_cell_label",
             how="inner",
             sort=False,
         )
@@ -794,13 +843,13 @@ def build_mapped_h5ad_inputs(
         else pd.DataFrame(columns=["cell_label", "geneID", "MIDCount"])
     )
 
-    mixed_gene_order = filtered_molecules.loc[
-        filtered_molecules["cell_label"].isin(mixed_order), "geneID"
+    mixed_gene_order = target_molecules.loc[
+        target_molecules["cell_label"].isin(mixed_order), "geneID"
     ].astype(str)
     source_gene_order = source_molecules["geneID"].astype(str)
     gene_order = pd.Index(sorted(set(mixed_gene_order.tolist()) | set(source_gene_order.tolist())))
 
-    mixed_x = build_cell_gene_matrix(filtered_molecules, mixed_order, gene_order.tolist())
+    mixed_x = build_cell_gene_matrix(target_molecules, mixed_order, gene_order.tolist())
     source_x = build_cell_gene_matrix(source_molecules, mixed_order, gene_order.tolist())
     return obs_df, gene_order, mixed_x, source_x
 
@@ -829,9 +878,11 @@ def write_summary(
     p5_cells: pd.DataFrame,
     mixed_cells: pd.DataFrame,
     mapping_df: pd.DataFrame,
-    filtered_molecules: pd.DataFrame,
+    target_molecules: pd.DataFrame,
     run_outputs: dict[str, dict[str, str]],
 ) -> None:
+    mapped_count = int(mapping_df["mapped_source_count"].gt(0).sum()) if not mapping_df.empty else 0
+    multiplet_count = int(mapping_df["is_multiplet"].sum()) if not mapping_df.empty else 0
     summary = {
         "mc": {
             "row_count": mc_rows,
@@ -847,9 +898,9 @@ def write_summary(
             "row_count": mixed_summary["mixed_row_count"],
             "total_mid_count": mixed_summary["mixed_mid_total"],
             "segmented_cell_count": int(len(mixed_cells)),
-            "doublet_cell_count": int(mapping_df["is_doublet"].sum()) if not mapping_df.empty else 0,
-            "kept_cell_count": int((~mapping_df["is_doublet"]).sum()) if not mapping_df.empty else 0,
-            "filtered_row_count": int(len(filtered_molecules)),
+            "mapped_cell_count": mapped_count,
+            "multiplet_cell_count": multiplet_count,
+            "target_molecule_row_count": int(len(target_molecules)),
             "cell_mask": run_outputs["mixed"]["cell_mask"],
         },
     }
@@ -980,8 +1031,8 @@ def main(argv: list[str] | None = None) -> int:
         p5_cells=p5_cells,
         min_mixed_coverage=args.min_mixed_coverage,
     )
-    log_step("filtering doublet molecules")
-    filtered_molecules = filter_mixed_doublets(mixed_molecules, mapping_df)
+    log_step("selecting mixed multiplet target molecules")
+    target_molecules = select_multiplet_molecules(mixed_molecules, mapping_df)
 
     log_step("writing intermediate parquet and GEM outputs")
     mc_cells.to_parquet(args.output_dir / "mc_cells.parquet", index=False)
@@ -992,16 +1043,16 @@ def main(argv: list[str] | None = None) -> int:
     mixed_molecules.to_parquet(args.output_dir / "mixed_molecules.parquet", index=False)
     candidates_df.to_parquet(args.output_dir / "mixed_mask_overlap_candidates.parquet", index=False)
     mapping_df.to_parquet(args.output_dir / "mixed_cell_mapping.parquet", index=False)
-    mapping_df.loc[mapping_df["is_doublet"]].to_parquet(args.output_dir / "mixed_doublets.parquet", index=False)
-    write_filtered_mixed_outputs(
-        filtered_molecules,
-        args.output_dir / "mixed_filtered.gem",
-        args.output_dir / "mixed_filtered_molecules.parquet",
+    mapping_df.loc[mapping_df["is_multiplet"]].to_parquet(args.output_dir / "mixed_multiplet_mapping.parquet", index=False)
+    write_mixed_molecule_outputs(
+        target_molecules,
+        args.output_dir / "mixed_multiplet.gem",
+        args.output_dir / "mixed_multiplet_molecules.parquet",
         read_gem_header(args.mc_gem),
     )
     obs_df, gene_order, mixed_x, source_x = build_mapped_h5ad_inputs(
         mixed_cells=mixed_cells,
-        filtered_molecules=filtered_molecules,
+        target_molecules=target_molecules,
         mapping_df=mapping_df,
         mc_molecules=mc_molecules,
         p5_molecules=p5_molecules,
@@ -1036,7 +1087,7 @@ def main(argv: list[str] | None = None) -> int:
         p5_cells=p5_cells,
         mixed_cells=mixed_cells,
         mapping_df=mapping_df,
-        filtered_molecules=filtered_molecules,
+        target_molecules=target_molecules,
         run_outputs=run_outputs,
     )
     log_step("pipeline complete")
