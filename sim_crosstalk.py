@@ -805,6 +805,34 @@ def build_mapped_h5ad_inputs(
     return obs_df, gene_order, mixed_x, source_x
 
 
+def filter_same_expression_cells(
+    obs_df: pd.DataFrame,
+    mixed_x: sparse.csr_matrix,
+    source_x: sparse.csr_matrix,
+) -> tuple[pd.DataFrame, sparse.csr_matrix, sparse.csr_matrix, pd.DataFrame]:
+    if mixed_x.shape != source_x.shape:
+        raise ValueError("mixed_x and source_x must have the same shape")
+    if len(obs_df) != mixed_x.shape[0]:
+        raise ValueError("obs_df row count must match expression matrix row count")
+
+    if mixed_x.shape[0] == 0:
+        empty_removed = obs_df.iloc[0:0].copy()
+        return obs_df.copy(), mixed_x.copy(), source_x.copy(), empty_removed
+
+    same_expression = np.asarray((mixed_x != source_x).getnnz(axis=1) == 0)
+    same_expression = same_expression.reshape(-1)
+    if not np.any(same_expression):
+        empty_removed = obs_df.iloc[0:0].copy()
+        return obs_df.copy(), mixed_x.copy(), source_x.copy(), empty_removed
+
+    keep_mask = ~same_expression
+    removed_df = obs_df.iloc[same_expression].copy()
+    filtered_obs = obs_df.iloc[keep_mask].copy()
+    filtered_mixed_x = mixed_x[keep_mask, :].copy()
+    filtered_source_x = source_x[keep_mask, :].copy()
+    return filtered_obs, filtered_mixed_x, filtered_source_x, removed_df
+
+
 def write_mixed_mapped_h5ad(
     output_path: Path,
     obs_df: pd.DataFrame,
@@ -831,7 +859,18 @@ def write_summary(
     mapping_df: pd.DataFrame,
     filtered_molecules: pd.DataFrame,
     run_outputs: dict[str, dict[str, str]],
+    same_expression_removed_count: int = 0,
+    mapped_h5ad_cell_count: int | None = None,
 ) -> None:
+    if mapped_h5ad_cell_count is None:
+        mapped_h5ad_cell_count = int(
+            (
+                (~mapping_df["is_doublet"])
+                & mapping_df["mapped_source_dataset"].ne("")
+                & mapping_df["mapped_source_label"].ne("")
+            ).sum()
+        ) if not mapping_df.empty else 0
+
     summary = {
         "mc": {
             "row_count": mc_rows,
@@ -850,6 +889,8 @@ def write_summary(
             "doublet_cell_count": int(mapping_df["is_doublet"].sum()) if not mapping_df.empty else 0,
             "kept_cell_count": int((~mapping_df["is_doublet"]).sum()) if not mapping_df.empty else 0,
             "filtered_row_count": int(len(filtered_molecules)),
+            "same_expression_removed_cell_count": int(same_expression_removed_count),
+            "mapped_h5ad_cell_count": int(mapped_h5ad_cell_count),
             "cell_mask": run_outputs["mixed"]["cell_mask"],
         },
     }
@@ -1006,6 +1047,14 @@ def main(argv: list[str] | None = None) -> int:
         mc_molecules=mc_molecules,
         p5_molecules=p5_molecules,
     )
+    log_step("filtering h5ad cells with identical mapped expression")
+    obs_df, mixed_x, source_x, same_expression_df = filter_same_expression_cells(
+        obs_df=obs_df,
+        mixed_x=mixed_x,
+        source_x=source_x,
+    )
+    same_expression_df.to_parquet(args.output_dir / "mixed_same_expression_cells.parquet", index=False)
+
     log_step("writing mixed_maped.h5ad")
     write_mixed_mapped_h5ad(
         args.output_dir / "mixed_maped.h5ad",
@@ -1038,6 +1087,8 @@ def main(argv: list[str] | None = None) -> int:
         mapping_df=mapping_df,
         filtered_molecules=filtered_molecules,
         run_outputs=run_outputs,
+        same_expression_removed_count=len(same_expression_df),
+        mapped_h5ad_cell_count=len(obs_df),
     )
     log_step("pipeline complete")
     return 0

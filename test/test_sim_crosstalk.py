@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import errno
+import types
 import unittest
 from io import StringIO
 from pathlib import Path
@@ -15,6 +16,7 @@ import numpy as np
 import pandas as pd
 import tifffile
 import anndata as ad
+from scipy import sparse
 
 CURR_PATH = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.append(CURR_PATH)
@@ -81,7 +83,9 @@ class MixedGemTest(unittest.TestCase):
                 called["dst"] = dst_path
                 Path(dst_path).write_text("gef", encoding="utf-8")
 
-            with mock.patch("cellbin2.matrix.matrix.gem_to_gef", side_effect=fake_gem_to_gef):
+            fake_matrix_module = types.ModuleType("cellbin2.matrix.matrix")
+            fake_matrix_module.gem_to_gef = fake_gem_to_gef
+            with mock.patch.dict(sys.modules, {"cellbin2.matrix.matrix": fake_matrix_module}):
                 result = sim_crosstalk.convert_gem_to_gef(gem_path, gef_path)
 
             self.assertEqual(result, gef_path)
@@ -425,6 +429,61 @@ class MappingRuleTest(unittest.TestCase):
         self.assertEqual(gene_order.tolist(), ["G1", "G2", "G4", "G5"])
         np.testing.assert_array_equal(mixed_x.toarray(), np.array([[0, 0, 0, 4], [0, 5, 0, 0], [3, 0, 0, 0]]))
         np.testing.assert_array_equal(source_x.toarray(), np.array([[0, 0, 0, 0], [0, 11, 1, 0], [10, 0, 2, 0]]))
+
+    def test_filter_same_expression_cells_removes_only_exact_mid_vectors(self) -> None:
+        obs_df = pd.DataFrame(
+            [
+                {
+                    "mixed_cell_label": "same_counts",
+                    "mapped_source_dataset": "MC",
+                    "mapped_source_label": "MC_1",
+                },
+                {
+                    "mixed_cell_label": "different_counts",
+                    "mapped_source_dataset": "P5",
+                    "mapped_source_label": "P5_1",
+                },
+                {
+                    "mixed_cell_label": "same_genes_different_counts",
+                    "mapped_source_dataset": "MC",
+                    "mapped_source_label": "MC_2",
+                },
+            ]
+        ).set_index("mixed_cell_label", drop=False)
+        mixed_x = sparse.csr_matrix(
+            np.array(
+                [
+                    [1, 2, 0],
+                    [3, 0, 1],
+                    [5, 0, 0],
+                ],
+                dtype=np.int32,
+            )
+        )
+        source_x = sparse.csr_matrix(
+            np.array(
+                [
+                    [1, 2, 0],
+                    [3, 0, 2],
+                    [4, 0, 0],
+                ],
+                dtype=np.int32,
+            )
+        )
+
+        filtered_obs, filtered_mixed_x, filtered_source_x, removed_df = sim_crosstalk.filter_same_expression_cells(
+            obs_df=obs_df,
+            mixed_x=mixed_x,
+            source_x=source_x,
+        )
+
+        self.assertEqual(removed_df["mixed_cell_label"].tolist(), ["same_counts"])
+        self.assertEqual(
+            filtered_obs["mixed_cell_label"].tolist(),
+            ["different_counts", "same_genes_different_counts"],
+        )
+        np.testing.assert_array_equal(filtered_mixed_x.toarray(), np.array([[3, 0, 1], [5, 0, 0]]))
+        np.testing.assert_array_equal(filtered_source_x.toarray(), np.array([[3, 0, 2], [4, 0, 0]]))
 
     def test_compute_chip_tile_bounds_handles_mixed_and_p5_shapes(self) -> None:
         self.assertEqual(
@@ -775,6 +834,10 @@ class MainFlowTest(unittest.TestCase):
 
             recorded_runs: list[tuple[str, Path, Path]] = []
 
+            def fake_convert_gem_to_gef(gem_path: Path, gef_path: Path) -> Path:
+                gef_path.write_text(f"gef for {gem_path.name}", encoding="utf-8")
+                return gef_path
+
             def fake_run_cellbin2(
                 sample_name: str,
                 config_path: Path,
@@ -797,8 +860,10 @@ class MainFlowTest(unittest.TestCase):
                 return {"cell_mask": str(mask_path)}
 
             original_runner = sim_crosstalk.run_cellbin2
+            original_converter = sim_crosstalk.convert_gem_to_gef
             try:
                 sim_crosstalk.run_cellbin2 = fake_run_cellbin2
+                sim_crosstalk.convert_gem_to_gef = fake_convert_gem_to_gef
                 exit_code = sim_crosstalk.main(
                     [
                         "--mc-gem",
@@ -814,6 +879,7 @@ class MainFlowTest(unittest.TestCase):
                 )
             finally:
                 sim_crosstalk.run_cellbin2 = original_runner
+                sim_crosstalk.convert_gem_to_gef = original_converter
 
             self.assertEqual(exit_code, 0)
             self.assertEqual([run[0] for run in recorded_runs], ["Y40178MC", "Y40178P5", "mixed"])
@@ -821,18 +887,22 @@ class MainFlowTest(unittest.TestCase):
             raw_mixed = pd.read_csv(output_dir / "mixed.gem", sep="\t", comment="#")
             filtered_mixed = pd.read_csv(output_dir / "mixed_filtered.gem", sep="\t", comment="#")
             mapping = pd.read_parquet(output_dir / "mixed_cell_mapping.parquet")
+            same_expression = pd.read_parquet(output_dir / "mixed_same_expression_cells.parquet")
             summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
             mapped_h5ad = ad.read_h5ad(output_dir / "mixed_maped.h5ad")
 
             self.assertEqual(len(raw_mixed), 4)
             self.assertEqual(len(filtered_mixed), 4)
             self.assertEqual(sorted(mapping["mixed_cell_label"].tolist()), ["mixed_1", "mixed_2"])
+            self.assertEqual(sorted(same_expression["mixed_cell_label"].tolist()), ["mixed_1", "mixed_2"])
             self.assertEqual(summary["mixed"]["segmented_cell_count"], 2)
             self.assertEqual(summary["mixed"]["doublet_cell_count"], 0)
             self.assertEqual(summary["mixed"]["filtered_row_count"], 4)
-            self.assertEqual(mapped_h5ad.shape[0], 2)
+            self.assertEqual(summary["mixed"]["same_expression_removed_cell_count"], 2)
+            self.assertEqual(summary["mixed"]["mapped_h5ad_cell_count"], 0)
+            self.assertEqual(mapped_h5ad.shape[0], 0)
             self.assertIn("source", mapped_h5ad.layers.keys())
-            self.assertEqual(list(mapped_h5ad.obs["mixed_cell_label"]), ["mixed_1", "mixed_2"])
+            self.assertEqual(list(mapped_h5ad.obs["mixed_cell_label"]), [])
             self.assertEqual(mapped_h5ad.X.shape, mapped_h5ad.layers["source"].shape)
             self.assertTrue((output_dir / "spatial_tile_r10_c10.png").exists())
 
@@ -975,10 +1045,16 @@ class MainFlowTest(unittest.TestCase):
                 write_label_mask(mask_path, label_image)
                 return {"cell_mask": str(mask_path)}
 
+            def fake_convert_gem_to_gef(gem_path: Path, gef_path: Path) -> Path:
+                gef_path.write_text(f"gef for {gem_path.name}", encoding="utf-8")
+                return gef_path
+
             original_runner = sim_crosstalk.run_cellbin2
+            original_converter = sim_crosstalk.convert_gem_to_gef
             stdout_buffer = StringIO()
             try:
                 sim_crosstalk.run_cellbin2 = fake_run_cellbin2
+                sim_crosstalk.convert_gem_to_gef = fake_convert_gem_to_gef
                 with mock.patch("sys.stdout", stdout_buffer):
                     exit_code = sim_crosstalk.main(
                         [
@@ -995,6 +1071,7 @@ class MainFlowTest(unittest.TestCase):
                     )
             finally:
                 sim_crosstalk.run_cellbin2 = original_runner
+                sim_crosstalk.convert_gem_to_gef = original_converter
 
             self.assertEqual(exit_code, 0)
             output = stdout_buffer.getvalue()
@@ -1003,6 +1080,7 @@ class MainFlowTest(unittest.TestCase):
             self.assertIn("converting GEM to GEF", output)
             self.assertIn("running CellBin2 for Y40178MC", output)
             self.assertIn("assigning molecules to segmented cells", output)
+            self.assertIn("filtering h5ad cells with identical mapped expression", output)
             self.assertIn("writing mixed_maped.h5ad", output)
             self.assertIn("pipeline complete", output)
 
@@ -1035,6 +1113,7 @@ class NotebookFlowTest(unittest.TestCase):
             "sim_crosstalk.assign_molecules_to_cells",
             "sim_crosstalk.map_mixed_cells",
             "sim_crosstalk.filter_mixed_doublets",
+            "sim_crosstalk.filter_same_expression_cells",
             "sim_crosstalk.write_filtered_mixed_outputs",
             "sim_crosstalk.write_summary",
         ]:
